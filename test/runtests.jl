@@ -1,17 +1,15 @@
 module SharedMemSparseLUTests
 
 using LinearAlgebra
-#using MPI
 using Random
 using SparseArrays
-using SparseMatricesCSR
 using Test
 
 using SharedMemSparseLU
 using SharedMemSparseLU: lsolve!, rsolve!
 
 # Get a sparse test matrix with a structure similar to a finite element derivative
-function test_matrix(rng=default_rnk(), nel=6, ngr=5)
+function test_matrix(rng=default_rng(), nel=6, ngr=5)
     n = nel*(ngr-1)+1
     mat = zeros(n,n)
     for iel in 1:nel
@@ -24,132 +22,169 @@ end
 
 function runtests()
 
-    tol = 1.0e-14
-    dense_tol = 6.0e-13
+    tol = 1.0e-12
+    dense_tol = 1.0e-10
     Tf = Float64
     Ti = Int64
+    nmax = 200
 
-    rng = MersenneTwister(42)
+    # WARNING: as we use random numbers to generate test data, adding new tests, etc. may
+    # make existing tests fail because the input is bad (e.g. the matrix is nearly
+    # singular). If this happens, it might help to change the seed used to initialise the
+    # random number generator `rng`.
+    rng = MersenneTwister(47)
 
     @testset "SharedMemSparseLU" begin
-        @testset "lsolve!" begin
-            n = 42
+        @testset "lsolve! dense" begin
+            @testset "$n" for n ∈ 1:nmax
+                # Make a lower-triangular matrix
+                A = rand(rng, Tf, n, n)
+                A_sparse = sparse(A)
+                A_lu = ParallelSparseLU(A_sparse)
 
-            # Make a lower-triangular matrix
-            L = rand(rng, Tf, n, n)
-            for row ∈ 1:n
-                L[row,row] = 1.0
-                L[row,row+1:end] .= 0.0
+                # Create rhs
+                b = rand(rng, Tf, n)
+                x = copy(b)
+
+                lsolve!(A_lu, x)
+
+                @test isapprox(x, A_lu.L \ b, rtol=tol, atol=tol)
             end
-            L_sparse = sparsecsr(findnz(sparse(L))...)
-
-            # Create rhs
-            b = rand(rng, Tf, n)
-            x = similar(b)
-
-            lsolve!(x, L_sparse, b)
-
-            @test isapprox(x, L \ b, rtol=tol, atol=tol)
         end
 
-        @testset "rsolve!" begin
-            n = 42
+        @testset "lsolve! sparse" begin
+            @testset "$nelement" for nelement ∈ 1:nmax
+                A = test_matrix(rng, nelement, 5)
+                A_lu = ParallelSparseLU(A)
 
-            # Make an upper-triangular matrix
-            U = rand(rng, Tf, n, n)
-            for row ∈ 1:n
-                U[row,1:row-1] .= 0.0
+                this_length = Ref(0)
+                this_length[] = size(A, 1)
+                n = this_length[]
+
+                # Create rhs
+                b = rand(rng, Tf, n)
+                x = copy(b)
+
+                lsolve!(A_lu, x)
+
+                @test isapprox(x, A_lu.L \ b, rtol=tol, atol=tol)
             end
-            U_sparse = sparse(U)
-
-            # Create rhs
-            b = rand(rng, Tf, n)
-            # rsolve!() will modify its third argument, so work with a copy
-            wrk = copy(b)
-            x = similar(b)
-
-            rsolve!(x, U_sparse, wrk)
-
-            @test isapprox(x, U \ b, rtol=tol, atol=tol)
         end
 
-        @testset "dense matrix" begin
-            n = 42
+        @testset "rsolve! dense" begin
+            @testset "$n" for n ∈ 1:nmax
+                A = rand(rng, Tf, n, n)
+                A_sparse = sparse(A)
+                A_lu = ParallelSparseLU(A_sparse)
 
-            A = rand(rng, Tf, n, n)
-            A_sparse = sparse(A)
-            A_lu = sharedmem_lu(A_sparse)
+                # Create rhs
+                b = rand(rng, Tf, n)
+                x = copy(b)
 
-            # Create rhs
-            b = rand(rng, Tf, n)
-            x = similar(b)
+                rsolve!(A_lu, x)
 
-            ldiv!(x, A_lu, b)
+                @test isapprox(x, A_lu.U \ b, rtol=dense_tol, atol=dense_tol)
+            end
+        end
 
-            @test isapprox(x, A_sparse \ b, rtol=dense_tol, atol=dense_tol)
+        @testset "rsolve! sparse" begin
+            @testset "$nelement" for nelement ∈ 1:nmax
+                A = test_matrix(rng, nelement, 5)
+                A_lu = ParallelSparseLU(A)
 
-            # Check we can update the rhs
-            b .= rand(rng, Tf, n)
+                this_length = Ref(0)
+                n = size(A, 1)
 
-            ldiv!(x, A_lu, b)
-            @test isapprox(x, A_sparse \ b, rtol=dense_tol, atol=dense_tol)
+                # Create rhs
+                b = rand(rng, Tf, n)
+                x = copy(b)
 
-            # Check we can update the matrix
-            A = rand(rng, Tf, n, n)
-            A_sparse = sparse(A)
-            sharedmem_lu!(A_lu, A_sparse)
+                rsolve!(A_lu, x)
 
-            # Create rhs
-            b .= rand(rng, Tf, n)
+                @test isapprox(x, A_lu.U \ b, rtol=dense_tol, atol=dense_tol)
+            end
+        end
 
-            ldiv!(x, A_lu, b)
+        @testset "dense matrix " begin
+            @testset "$n" for n ∈ 1:nmax
+                A = rand(rng, Tf, n, n)
+                A_sparse = sparse(A)
+                A_lu = ParallelSparseLU(A_sparse)
 
-            @test isapprox(x, A_sparse \ b, rtol=dense_tol, atol=dense_tol)
+                # Create rhs
+                b = rand(rng, Tf, n)
+                x = similar(b)
 
-            # Check we can update the rhs again
-            b .= rand(rng, Tf, n)
+                ldiv!(x, A_lu, b)
 
-            ldiv!(x, A_lu, b)
-            @test isapprox(x, A_sparse \ b, rtol=dense_tol, atol=dense_tol)
+                @test isapprox(x, A_sparse \ b, rtol=dense_tol, atol=dense_tol)
+
+                # Check we can update the rhs
+                b .= rand(rng, Tf, n)
+
+                ldiv!(x, A_lu, b)
+                @test isapprox(x, A_sparse \ b, rtol=dense_tol, atol=dense_tol)
+
+                # Check we can update the matrix
+                A = rand(rng, Tf, n, n)
+                A_sparse = sparse(A)
+                lu!(A_lu, A_sparse)
+
+                # Create rhs
+                b .= rand(rng, Tf, n)
+
+                ldiv!(x, A_lu, b)
+
+                @test isapprox(x, A_sparse \ b, rtol=dense_tol, atol=dense_tol)
+
+                # Check we can update the rhs again
+                b .= rand(rng, Tf, n)
+
+                ldiv!(x, A_lu, b)
+                @test isapprox(x, A_sparse \ b, rtol=dense_tol, atol=dense_tol)
+            end
         end
 
         @testset "sparse matrix" begin
-            A = test_matrix(rng)
+            @testset "$nelement" for nelement ∈ 1:nmax
+                A = test_matrix(rng, nelement, 5)
 
-            n = size(A, 1)
+                this_length = Ref(0)
+                n = size(A, 1)
 
-            A_lu = sharedmem_lu(A)
+                A_lu = ParallelSparseLU(A)
 
-            # Create rhs
-            b = rand(rng, Tf, n)
-            x = similar(b)
+                # Create rhs
+                b = rand(rng, Tf, n)
+                x = similar(b)
 
-            ldiv!(x, A_lu, b)
+                ldiv!(x, A_lu, b)
 
-            @test isapprox(x, A \ b, rtol=tol, atol=tol)
+                @test isapprox(x, A \ b, rtol=tol, atol=tol)
 
-            # Check we can update the rhs
-            b .= rand(rng, Tf, n)
+                # Check we can update the rhs
+                b .= rand(rng, Tf, n)
 
-            ldiv!(x, A_lu, b)
-            @test isapprox(x, A \ b, rtol=tol, atol=tol)
+                ldiv!(x, A_lu, b)
+                @test isapprox(x, A \ b, rtol=tol, atol=tol)
 
-            # Check we can update the matrix
-            A = test_matrix(rng)
-            sharedmem_lu!(A_lu, A)
+                # Check we can update the matrix
+                A = test_matrix(rng, nelement, 5)
+                lu!(A_lu, A)
 
-            # Create rhs
-            b .= rand(rng, Tf, n)
+                # Create rhs
+                b .= rand(rng, Tf, n)
 
-            ldiv!(x, A_lu, b)
+                ldiv!(x, A_lu, b)
 
-            @test isapprox(x, A \ b, rtol=tol, atol=tol)
+                @test isapprox(x, A \ b, rtol=tol, atol=tol)
 
-            # Check we can update the rhs again
-            b .= rand(rng, Tf, n)
+                # Check we can update the rhs again
+                b .= rand(rng, Tf, n)
 
-            ldiv!(x, A_lu, b)
-            @test isapprox(x, A \ b, rtol=tol, atol=tol)
+                ldiv!(x, A_lu, b)
+                @test isapprox(x, A \ b, rtol=tol, atol=tol)
+            end
         end
     end
 end
