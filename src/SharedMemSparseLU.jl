@@ -417,7 +417,7 @@ struct ParallelSparseLU{Tf, Ti, TLU <: Union{SparseArrays.UMFPACK.UmfpackLU,Noth
         # Get column sizes, which we will use to estimate a sensible chunk size.
         # Exclude the diagonal from the column sizes, as that is treated specially.
         col_sizes = U_colptr[2:end] .- U_colptr[1:end-1] .- 1
-        mean_col_size = mean(col_sizes)
+        mean_col_size = round(Ti, mean(col_sizes))
         max_col_size = maximum(col_sizes)
 
         # Guess a sensible chunk_size to balance communication and computation costs.
@@ -469,7 +469,7 @@ struct ParallelSparseLU{Tf, Ti, TLU <: Union{SparseArrays.UMFPACK.UmfpackLU,Noth
             for c ∈ 1:rsolve_n_chunks
                 this_chunk = bottom_chunk - c + 1
                 if this_chunk ≥ 1
-                    if this_chunk == rsolve_n_chunks
+                    if this_chunk == length(rsolve_chunk_edges)
                         chunk_bottom = m
                     else
                         chunk_bottom = rsolve_chunk_edges[this_chunk+1] - 1
@@ -677,12 +677,7 @@ function lsolve!(x, F::ParallelSparseLU{Tf,Ti}, b) where {Tf,Ti}
         # Diagonal entry of L
         x[1] = b[1]
 
-        this_col_ranges = @view col_ranges[:,1]
         for c ∈ 1:n_chunks
-            for j ∈ this_col_ranges[c]
-                col = colval[j]
-                x[1] -= x[col] * nzval[j]
-            end
             # Signal to next process that it can start its corresponding chunk now.
             # Use MPI.Ibarrier() because this process does not need to wait for the next
             # process to reach this barrier.
