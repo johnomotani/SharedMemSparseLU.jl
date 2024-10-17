@@ -60,7 +60,7 @@ Pure-Julia implementation of LU algorithms for sparse matrices
 """
 module SharedMemSparseLU
 
-export sharedmem_lu, sharedmem_lu!
+export ParallelSparseLU
 
 using LinearAlgebra
 using MPI
@@ -70,7 +70,7 @@ using SparseMatricesCSR
 using StatsBase: mean
 
 import Base: getindex, setindex!, size, sizehint!, resize!
-import LinearAlgebra: ldiv!
+import LinearAlgebra: ldiv!, lu!
 
 # Define this mutable struct so that we can give it a finalizer
 mutable struct MPI_Win_store_struct <: AbstractVector{MPI.Win}
@@ -104,6 +104,57 @@ function resize!(v::MPI_Win_store_struct, args...; kwargs...)
     return resize!(v.win_store, args...; kwargs...)
 end
 
+# Ideally this functionality would be provided by SparseArrays.jl, but probably will not b
+# because that package does not define/include a SparseMatrixCSR type. As a workaround,
+# define this function ourselves - somewhat hacky because this depends on internals of
+# SparseArrays.jl, so may break. This is a hacked copy of
+# https://github.com/JuliaSparse/SparseArrays.jl/blob/313a04f4a78bbc534f89b6b4d9c598453e2af17c/src/solvers/umfpack.jl#L842-L857
+using SparseArrays.UMFPACK: UmfpackLU, umfpack_numeric!, umf_lunz, @isok,
+                            umfpack_dl_get_numeric, increment!
+function get_L_matrix_CSR(F::UmfpackLU{Tf,Ti}) where {Tf,Ti}
+    umfpack_numeric!(F)        # ensure the numeric decomposition exists
+    (lnz, unz, n_row, n_col, nz_diag) = umf_lunz(F)
+    Lp = Vector{Ti}(undef, n_row + 1)
+    # L is returned in CSR (compressed sparse row) format
+    Lj = Vector{Ti}(undef, lnz)
+    Lx = Vector{Tf}(undef, lnz)
+    @isok umfpack_dl_get_numeric(
+                     Lp, Lj, Lx,
+                     C_NULL, C_NULL, C_NULL,
+                     C_NULL, C_NULL, C_NULL,
+                     C_NULL, C_NULL, F.numeric)
+    return SparseMatrixCSR{1}(n_row, n_col, increment!(Lp), increment!(Lj), Lx)
+end
+
+function allocate_shared(comm::MPI.Comm, T, dims...)
+    comm_rank = MPI.Comm_rank(comm)
+    n = prod(dims)
+
+    if n == 0
+        # Special handling as some MPI implementations cause errors when allocating a
+        # size-zero array
+        array = Array{T}(undef, dims...)
+
+        return array
+    end
+
+    if comm_rank == 0
+        # Allocate points on rank-0 for simplicity
+        dims_local = dims
+    else
+        dims_local = Tuple(0 for _ ∈ dims)
+    end
+
+    win, array_temp = MPI.Win_allocate_shared(Array{T}, dims_local, comm)
+
+    # Array is allocated contiguously, but `array_temp` contains only the 'locally owned'
+    # part.  We want to use as a shared array, so want to wrap the entire shared array.
+    # Get array from rank-0 process, which 'owns' the whole array.
+    array = MPI.Win_shared_query(Array{T}, dims, win; rank=0)
+
+    return array, win
+end
+
 struct ParallelSparseLU{Tf, Ti}
     m::Ti
     n::Ti
@@ -132,28 +183,337 @@ struct ParallelSparseLU{Tf, Ti}
     rsolve_has_right_col::Bool
     rsolve_has_left_col::Bool
     MPI_Win_store::MPI_Win_store_struct
-end
 
-# Ideally this functionality would be provided by SparseArrays.jl, but probably will not b
-# because that package does not define/include a SparseMatrixCSR type. As a workaround,
-# define this function ourselves - somewhat hacky because this depends on internals of
-# SparseArrays.jl, so may break. This is a hacked copy of
-# https://github.com/JuliaSparse/SparseArrays.jl/blob/313a04f4a78bbc534f89b6b4d9c598453e2af17c/src/solvers/umfpack.jl#L842-L857
-using SparseArrays.UMFPACK: UmfpackLU, umfpack_numeric!, umf_lunz, @isok,
-                            umfpack_dl_get_numeric, increment!
-function get_L_matrix_CSR(F::UmfpackLU{Tf,Ti}) where {Tf,Ti}
-    umfpack_numeric!(F)        # ensure the numeric decomposition exists
-    (lnz, unz, n_row, n_col, nz_diag) = umf_lunz(F)
-    Lp = Vector{Ti}(undef, n_row + 1)
-    # L is returned in CSR (compressed sparse row) format
-    Lj = Vector{Ti}(undef, lnz)
-    Lx = Vector{Tf}(undef, lnz)
-    @isok umfpack_dl_get_numeric(
-                     Lp, Lj, Lx,
-                     C_NULL, C_NULL, C_NULL,
-                     C_NULL, C_NULL, C_NULL,
-                     C_NULL, C_NULL, F.numeric)
-    return SparseMatrixCSR{1}(n_row, n_col, increment!(Lp), increment!(Lj), Lx)
+    function ParallelSparseLU{Tf,Ti}(A::Union{SparseMatrixCSC{Tf,Ti},Nothing},
+                                     comm=MPI.COMM_WORLD) where {Tf,Ti}
+        # Use `lu()` from LinearAlgebra to calculate the L and U factors
+
+        comm_rank = MPI.Comm_rank(comm)
+        comm_size = MPI.Comm_size(comm)
+
+        if comm_rank == 0 && A === nothing
+            error("A matrix must be passed on rank-0 of communicator")
+        end
+
+        # Get a communicator that includes this process and the next one in the communicator,
+        # and another than includes this process and the previous one in the communicator.
+        comm_even_odd = MPI.Comm_split(comm, comm_rank - (comm_rank % 2), comm_rank)
+        color = comm_rank - ((comm_rank + 1) % 2)
+        if color < 0
+            color = comm_size - 1
+        end
+        comm_odd_even = MPI.Comm_split(comm, color, comm_rank)
+        if comm_rank % 2 == 0
+            comm_prev_proc = comm_odd_even
+            comm_next_proc = comm_even_odd
+        else
+            comm_prev_proc = comm_even_odd
+            comm_next_proc = comm_odd_even
+        end
+        if comm_size % 2 != 0
+            # Odd number of processes. In
+            # comm_even_odd the last process will not be connected to any other, and in
+            # comm_odd_even the first process will not be connected to any other. They need to
+            # be connected appropriately.
+            if comm_rank == 0
+                comm_prev_proc = MPI.Comm_split(comm, 0, comm_rank)
+            elseif comm_rank == comm_size - 1
+                comm_next_proc = MPI.Comm_split(comm, 0, comm_rank)
+            else
+                # Other processes do not need to participate in this communicator split.
+                comm_prev_proc = MPI.Comm_split(comm, nothing, comm_rank)
+            end
+        end
+
+        MPI_Win_store = MPI_Win_store_struct()
+
+        this_length = Ref(0)
+
+        if comm_rank == 0
+            lu_object = lu(A)
+            L_serial = get_L_matrix_CSR(lu_object)
+            U_serial = lu_object.U
+            m, n = size(A)
+            this_length[] = m
+            MPI.Bcast!(this_length, comm)
+            this_length[] = n
+            MPI.Bcast!(this_length, comm)
+        else
+            MPI.Bcast!(this_length, comm)
+            m = this_length[]
+            MPI.Bcast!(this_length, comm)
+            n = this_length[]
+        end
+
+        # Allocate and fill the L SparseMatrixCSR object
+        ################################################
+
+        if comm_rank == 0
+            this_length[] = length(L_serial.rowptr)
+            MPI.Bcast!(this_length, comm)
+        else
+            MPI.Bcast!(this_length, comm)
+        end
+        L_rowptr, win = allocate_shared(comm, Ti, this_length[])
+        push!(MPI_Win_store, win)
+
+        if comm_rank == 0
+            this_length[] = length(L_serial.colval)
+            MPI.Bcast!(this_length, comm)
+        else
+            MPI.Bcast!(this_length, comm)
+        end
+        L_colval, win = allocate_shared(comm, Ti, this_length[])
+        push!(MPI_Win_store, win)
+        L_nzval, win = allocate_shared(comm, Tf, this_length[])
+        push!(MPI_Win_store, win)
+
+        if comm_rank == 0
+            L_rowptr .= L_serial.rowptr
+            L_colval .= L_serial.colval
+            L_nzval .= L_serial.nzval
+        end
+        MPI.Barrier(comm)
+
+        L = SparseMatrixCSR{1}(m, n, L_rowptr, L_colval, L_nzval)
+
+        # Allocate and fill the U SparseMatrixCSC object
+        ################################################
+
+        this_length = Ref(0)
+        if comm_rank == 0
+            this_length[] = length(U_serial.colptr)
+            MPI.Bcast!(this_length, comm)
+        else
+            MPI.Bcast!(this_length, comm)
+        end
+        U_colptr, win = allocate_shared(comm, Ti, this_length[])
+        push!(MPI_Win_store, win)
+
+        if comm_rank == 0
+            this_length[] = length(U_serial.rowval)
+            MPI.Bcast!(this_length, comm)
+        else
+            MPI.Bcast!(this_length, comm)
+        end
+        U_rowval, win = allocate_shared(comm, Ti, this_length[])
+        push!(MPI_Win_store, win)
+        U_nzval, win = allocate_shared(comm, Tf, this_length[])
+        push!(MPI_Win_store, win)
+
+        if comm_rank == 0
+            U_colptr .= U_serial.colptr
+            U_rowval .= U_serial.rowval
+            U_nzval .= U_serial.nzval
+        end
+        MPI.Barrier(comm)
+
+        U = SparseMatrixCSC(m, n, U_colptr, U_rowval, U_nzval)
+
+        p, win = allocate_shared(comm, Ti, m)
+        push!(MPI_Win_store, win)
+        q, win = allocate_shared(comm, Ti, m)
+        push!(MPI_Win_store, win)
+        Rs, win = allocate_shared(comm, Tf, m)
+        push!(MPI_Win_store, win)
+
+        if comm_rank == 0
+            p .= lu_object.p
+            q .= lu_object.q
+            Rs .= lu_object.Rs
+        end
+
+        wrk, win = allocate_shared(comm, Tf, m)
+        push!(MPI_Win_store, win)
+
+        # Get a sub-range for this process to iterate over in `wrk` from a global index range.
+        # Define chunk_size so that comm_size*chunk_size ≥ m, with equality if comm_size
+        # divides m exactly.
+        chunk_size = (m + comm_size - 1) ÷ comm_size
+        imin = comm_rank * chunk_size + 1
+        imax = min((comm_rank + 1) * chunk_size + 1 - 1, m)
+        wrk_range = imin:imax
+
+        lsolve_row_range = 1+comm_rank:comm_size:m
+        if 1 ∈ lsolve_row_range
+            lsolve_has_first_row = true
+        else
+            lsolve_has_first_row = false
+        end
+        if n ∈ lsolve_row_range
+            lsolve_has_last_row = true
+        else
+            lsolve_has_last_row = false
+        end
+
+        rsolve_col_range = n-comm_rank:-comm_size:1
+        if 1 ∈ rsolve_col_range
+            rsolve_has_left_col = true
+        else
+            rsolve_has_left_col = false
+        end
+        if n ∈ rsolve_col_range
+            rsolve_has_right_col = true
+        else
+            rsolve_has_right_col = false
+        end
+
+        MPI.Barrier(comm)
+
+        L_rowptr = L.rowptr
+        L_colval = L.colval
+
+        # Get row sizes, which we will use to estimate a sensible chunk size.
+        # Exclude the diagonal from the row sizes, as that is treated specially.
+        row_sizes = L_rowptr[2:end] .- L_rowptr[1:end-1] .- 1
+        mean_row_size = mean(row_sizes)
+        max_row_size = maximum(row_sizes)
+
+        # Guess a sensible chunk_size to balance communication and computation costs.
+        # Every row will be divided into `lsolve_n_chunks` chunks of size `chunk_size`. For
+        # many rows several chunks will probably be empty, but use the same `lsolve_n_chunks`
+        # and `chunk_size` for every row to guarantee that there are no race condition errors
+        # even though row sizes can vary.
+        if comm_size == 1
+            # Special case - only ever want one chunk as there is no parallelism.
+            chunk_size = n
+            lsolve_n_chunks = 1
+        else
+            chunk_size = max(mean_row_size ÷ comm_size, 1)
+            lsolve_n_chunks = (max_row_size + chunk_size - 1) ÷ chunk_size
+        end
+
+        lsolve_col_ranges = Matrix{StepRange{Int64}}(undef, lsolve_n_chunks, length(lsolve_row_range))
+
+        for (myrow_counter,row) ∈ enumerate(lsolve_row_range)
+            # Indices of sub-diagonal values in this row
+            jmin = L_rowptr[row]
+            # `L_rowptr[row+1]` is the first element of the next row. `L_rowptr[row+1]-1`
+            # would be the diagonal element of L, so the '-2' here is to skip that
+            # diagonal element.
+            jmax = L_rowptr[row+1]-2
+
+            thisrow_colvals = [L_colval[j] for j ∈ jmin:jmax]
+
+            for c ∈ 1:lsolve_n_chunks
+                # Chunks are created right-to-left from the diagonal
+                chunk_right = row - (c-1)*chunk_size - 1
+                chunk_left = row - c*chunk_size
+
+                # If the value being searched for is less than all the values in the array,
+                # `searchsortedlast()` returns 0, and `searchsortedfirst()` returns 1, so that
+                # in that case we get an empty range.
+                j_right = jmin - 1 + searchsortedlast(thisrow_colvals, chunk_right)
+                j_left = jmin - 1 + searchsortedfirst(thisrow_colvals, chunk_left)
+
+                lsolve_col_ranges[c, row] = j_right:-1:j_left
+            end
+        end
+
+        U_colptr = U.colptr
+        U_rowval = U.rowval
+
+        # Get column sizes, which we will use to estimate a sensible chunk size.
+        # Exclude the diagonal from the column sizes, as that is treated specially.
+        col_sizes = U_colptr[2:end] .- U_colptr[1:end-1] .- 1
+        mean_col_size = mean(col_sizes)
+        max_col_size = maximum(col_sizes)
+
+        # Guess a sensible chunk_size to balance communication and computation costs.
+        # Every column will be divided into `rsolve_n_chunks` chunks of size `chunk_size`. For
+        # many columns several chunks will probably be empty, but use the same
+        # `rsolve_n_chunks` and `chunk_size` for every column to guarantee that there are no
+        # race condition errors even though column sizes can vary.
+        if comm_size == 1
+            # Special case - only ever want one chunk as there is no parallelism.
+            chunk_size = m
+        else
+            chunk_size = max(mean_col_size ÷ comm_size, 1)
+        end
+
+        # For rsolve!(), to avoid race conditions the chunks need to be aligned to fixed rows
+        # in the matrix.
+        # First find the maximum number of chunks needed for any column
+        rsolve_chunk_edges = 1:chunk_size:m
+        rsolve_n_chunks = 0
+        for col ∈ 1:n
+            # Indices of super-diagonal values in this column
+            this_minrow = U_rowval[U_colptr[col]]
+            # `U_colptr[col+1]` is the first element of the next column. `U_colptr[row+1]-1`
+            # would be the diagonal element of U, so the '-2' here is to skip that diagonal
+            # element.
+            this_maxrow = U_rowval[max(U_colptr[col+1]-2,1)]
+
+            chunk_minrow = searchsortedlast(rsolve_chunk_edges, this_minrow)
+            chunk_maxrow = searchsortedlast(rsolve_chunk_edges, this_maxrow)
+            rsolve_n_chunks = max(rsolve_n_chunks, chunk_maxrow - chunk_minrow + 1)
+        end
+
+        rsolve_row_ranges = Matrix{StepRange{Int64}}(undef, rsolve_n_chunks, length(rsolve_col_range))
+        rsolve_is_chunk_edge = Vector{Bool}(undef, length(rsolve_col_range))
+        for (mycol_counter,col) ∈ enumerate(rsolve_col_range)
+            # Indices of super-diagonal values in this column
+            jmin = U_colptr[col]
+            # `U_colptr[col+1]` is the first element of the next column. `U_colptr[row+1]-1`
+            # would be the diagonal element of U, so the '-2' here is to skip that diagonal
+            # element.
+            jmax = U_colptr[col+1]-2
+
+            thiscol_rowvals = [U_rowval[j] for j ∈ jmin:jmax]
+
+            # Chunk edges are given by rsolve_chunk_edges. Sort thiscol_rowvals into
+            # chunks.
+            rsolve_is_chunk_edge[mycol_counter] = (col ∈ rsolve_chunk_edges)
+            bottom_chunk = searchsortedlast(rsolve_chunk_edges, col)
+            for c ∈ 1:rsolve_n_chunks
+                this_chunk = bottom_chunk - c + 1
+                if this_chunk ≥ 1
+                    if this_chunk == rsolve_n_chunks
+                        chunk_bottom = m
+                    else
+                        chunk_bottom = rsolve_chunk_edges[this_chunk+1] - 1
+                    end
+                    chunk_top = rsolve_chunk_edges[this_chunk]
+                else
+                    # No points in this chunk
+                    chunk_bottom = 0
+                    chunk_top = 1
+                end
+
+                # If the value being searched for is less than all the values in the array,
+                # `searchsortedlast()` returns 0, and `searchsortedfirst()` returns 1, so that
+                # in that case we get an empty range.
+                j_bottom = jmin - 1 + searchsortedlast(thiscol_rowvals, chunk_bottom)
+                j_top = jmin - 1 + searchsortedfirst(thiscol_rowvals, chunk_top)
+
+                rsolve_row_ranges[c, mycol_counter] = j_bottom:-1:j_top
+            end
+        end
+
+        if lsolve_has_first_row
+            # Remove this row from lsolve_row_range as it will be treated specially.
+            lsolve_row_range = lsolve_row_range[2:end]
+        end
+        if lsolve_has_last_row
+            # Remove this row from lsolve_row_range as it will be treated specially.
+            lsolve_row_range = lsolve_row_range[1:end-1]
+        end
+        if rsolve_has_left_col
+            # Remove this col from lsolve_row_range as it will be treated specially.
+            rsolve_col_range = rsolve_col_range[2:end]
+        end
+        if rsolve_has_right_col
+            # Remove this col from lsolve_row_range as it will be treated specially.
+            rsolve_col_range = rsolve_col_range[1:end-1]
+        end
+
+        return new(m, n, L, U, p, q, Rs, wrk, lu_object, comm, comm_rank, comm_size,
+                   comm_prev_proc, comm_next_proc, wrk_range, lsolve_row_range,
+                   lsolve_n_chunks, lsolve_col_ranges, lsolve_has_first_row,
+                   lsolve_has_last_row, rsolve_col_range, rsolve_n_chunks,
+                   rsolve_row_ranges, rsolve_has_right_col, rsolve_has_left_col,
+                   MPI_Win_store)
+    end
 end
 
 """
@@ -188,357 +548,8 @@ function allocate_shared(F::ParallelSparseLU{Tf,Ti}, dims...; int=false) where {
 
     return array
 end
-function allocate_shared(comm::MPI.Comm, T, dims...)
-    comm_rank = MPI.Comm_rank(comm)
-    n = prod(dims)
 
-    if n == 0
-        # Special handling as some MPI implementations cause errors when allocating a
-        # size-zero array
-        array = Array{T}(undef, dims...)
-
-        return array
-    end
-
-    if comm_rank == 0
-        # Allocate points on rank-0 for simplicity
-        dims_local = dims
-    else
-        dims_local = Tuple(0 for _ ∈ dims)
-    end
-
-    win, array = MPI.Win_allocate_shared(Array{T}, dims_local, comm)
-
-    return array, win
-end
-
-function sharedmem_lu(A::SparseMatrixCSC{Tf,Ti}, comm=MPI.COMM_WORLD) where {Tf,Ti}
-    # Use `lu()` from LinearAlgebra to calculate the L and U factors
-
-    comm_rank = MPI.Comm_rank(comm)
-    comm_size = MPI.Comm_size(comm)
-
-    # Get a communicator that includes this process and the next one in the communicator,
-    # and another than includes this process and the previous one in the communicator.
-    comm_even_odd = MPI.Comm_split(comm, comm_rank - (comm_rank % 2), comm_rank)
-    color = comm_rank - ((comm_rank + 1) % 2)
-    if color < 0
-        color = comm_size - 1
-    end
-    comm_odd_even = MPI.Comm_split(comm, color, comm_rank)
-    if comm_rank % 2 == 0
-        comm_prev_proc = comm_odd_even
-        comm_next_proc = comm_even_odd
-    else
-        comm_prev_proc = comm_even_odd
-        comm_next_proc = comm_odd_even
-    end
-    if comm_size % 2 != 0
-        # Odd number of processes. In
-        # comm_even_odd the last process will not be connected to any other, and in
-        # comm_odd_even the first process will not be connected to any other. They need to
-        # be connected appropriately.
-        if comm_rank == 0
-            comm_prev_proc = MPI.Comm_split(comm, 0, comm_rank)
-        elseif comm_rank == comm_size - 1
-            comm_next_proc = MPI.Comm_split(comm, 0, comm_rank)
-        else
-            # Other processes do not need to participate in this communicator split.
-            comm_prev_proc = MPI.Comm_split(comm, nothing, comm_rank)
-        end
-    end
-
-    MPI_Win_store = MPI_Win_store_struct()
-
-    this_length = Ref(0)
-
-    if comm_rank == 0
-        lu_object = lu(A)
-        L_serial = get_L_matrix_CSR(lu_object)
-        U_serial = lu_object.U
-        m, n = size(A)
-        this_length[] = m
-        MPI.Bcast!(this_length, comm)
-        this_length[] = n
-        MPI.Bcast!(this_length, comm)
-    else
-        MPI.Bcast!(this_length, comm)
-        m = this_length[]
-        MPI.Bcast!(this_length, comm)
-        n = this_length[]
-    end
-
-    # Allocate and fill the L SparseMatrixCSR object
-    ################################################
-
-    if comm_rank == 0
-        this_length[] = length(L_serial.rowptr)
-        MPI.Bcast!(this_length, comm)
-    else
-        MPI.Bcast!(this_length, comm)
-    end
-    L_rowptr, win = allocate_shared(comm, Ti, this_length[])
-    push!(MPI_Win_store, win)
-
-    if comm_rank == 0
-        this_length[] = length(L_serial.colval)
-        MPI.Bcast!(this_length, comm)
-    else
-        MPI.Bcast!(this_length, comm)
-    end
-    L_colval, win = allocate_shared(comm, Ti, this_length[])
-    push!(MPI_Win_store, win)
-    L_nzval, win = allocate_shared(comm, Tf, this_length[])
-    push!(MPI_Win_store, win)
-
-    if comm_rank == 0
-        L_rowptr .= L_serial.rowptr
-        L_colval .= L_serial.colval
-        L_nzval .= L_serial.nzval
-    end
-    MPI.Barrier(comm)
-
-    L = SparseMatrixCSR{1}(m, n, L_rowptr, L_colval, L_nzval)
-
-    # Allocate and fill the U SparseMatrixCSC object
-    ################################################
-
-    this_length = Ref(0)
-    if comm_rank == 0
-        this_length[] = length(U_serial.colptr)
-        MPI.Bcast!(this_length, comm)
-    else
-        MPI.Bcast!(this_length, comm)
-    end
-    U_colptr, win = allocate_shared(comm, Ti, this_length[])
-    push!(MPI_Win_store, win)
-
-    if comm_rank == 0
-        this_length[] = length(U_serial.rowval)
-        MPI.Bcast!(this_length, comm)
-    else
-        MPI.Bcast!(this_length, comm)
-    end
-    U_rowval, win = allocate_shared(comm, Ti, this_length[])
-    push!(MPI_Win_store, win)
-    U_nzval, win = allocate_shared(comm, Tf, this_length[])
-    push!(MPI_Win_store, win)
-
-    if comm_rank == 0
-        U_colptr .= U_serial.colptr
-        U_rowval .= U_serial.rowval
-        U_nzval .= U_serial.nzval
-    end
-    MPI.Barrier(comm)
-
-    U = SparseMatrixCSC(m, n, U_colptr, U_rowval, U_nzval)
-
-    p, win = allocate_shared(comm, Ti, m)
-    push!(MPI_Win_store, win)
-    q, win = allocate_shared(comm, Ti, m)
-    push!(MPI_Win_store, win)
-    Rs, win = allocate_shared(comm, Tf, m)
-    push!(MPI_Win_store, win)
-
-    if comm_rank == 0
-        p .= lu_object.p
-        q .= lu_object.q
-        Rs .= lu_object.Rs
-    end
-
-    wrk, win = allocate_shared(comm, Tf, m)
-    push!(MPI_Win_store, win)
-
-    # Get a sub-range for this process to iterate over in `wrk` from a global index range.
-    # Define chunk_size so that comm_size*chunk_size ≥ m, with equality if comm_size
-    # divides m exactly.
-    chunk_size = (m + comm_size - 1) ÷ comm_size
-    imin = comm_rank * chunk_size + 1
-    imax = min((comm_rank + 1) * chunk_size + 1 - 1, m)
-    wrk_range = imin:imax
-
-    lsolve_row_range = 1+comm_rank:comm_size:m
-    if 1 ∈ lsolve_row_range
-        lsolve_has_first_row = true
-    else
-        lsolve_has_first_row = false
-    end
-    if n ∈ lsolve_row_range
-        lsolve_has_last_row = true
-    else
-        lsolve_has_last_row = false
-    end
-
-    rsolve_col_range = n-comm_rank:-comm_size:1
-    if 1 ∈ rsolve_col_range
-        rsolve_has_left_col = true
-    else
-        rsolve_has_left_col = false
-    end
-    if n ∈ rsolve_col_range
-        rsolve_has_right_col = true
-    else
-        rsolve_has_right_col = false
-    end
-
-    MPI.Barrier(comm)
-
-    L_rowptr = L.rowptr
-    L_colval = L.colval
-
-    # Get row sizes, which we will use to estimate a sensible chunk size.
-    # Exclude the diagonal from the row sizes, as that is treated specially.
-    row_sizes = L_rowptr[2:end] .- L_rowptr[1:end-1] .- 1
-    mean_row_size = mean(row_sizes)
-    max_row_size = maximum(row_sizes)
-
-    # Guess a sensible chunk_size to balance communication and computation costs.
-    # Every row will be divided into `lsolve_n_chunks` chunks of size `chunk_size`. For
-    # many rows several chunks will probably be empty, but use the same `lsolve_n_chunks`
-    # and `chunk_size` for every row to guarantee that there are no race condition errors
-    # even though row sizes can vary.
-    if comm_size == 1
-        # Special case - only ever want one chunk as there is no parallelism.
-        chunk_size = n
-        lsolve_n_chunks = 1
-    else
-        chunk_size = max(mean_row_size ÷ comm_size, 1)
-        lsolve_n_chunks = (max_row_size + chunk_size - 1) ÷ chunk_size
-    end
-
-    lsolve_col_ranges = Matrix{StepRange{Int64}}(undef, lsolve_n_chunks, length(lsolve_row_range))
-
-    for (myrow_counter,row) ∈ enumerate(lsolve_row_range)
-        # Indices of sub-diagonal values in this row
-        jmin = L_rowptr[row]
-        # `L_rowptr[row+1]` is the first element of the next row. `L_rowptr[row+1]-1`
-        # would be the diagonal element of L, so the '-2' here is to skip that
-        # diagonal element.
-        jmax = L_rowptr[row+1]-2
-
-        thisrow_colvals = [L_colval[j] for j ∈ jmin:jmax]
-
-        for c ∈ 1:lsolve_n_chunks
-            # Chunks are created right-to-left from the diagonal
-            chunk_right = row - (c-1)*chunk_size - 1
-            chunk_left = row - c*chunk_size
-
-            # If the value being searched for is less than all the values in the array,
-            # `searchsortedlast()` returns 0, and `searchsortedfirst()` returns 1, so that
-            # in that case we get an empty range.
-            j_right = jmin - 1 + searchsortedlast(thisrow_colvals, chunk_right)
-            j_left = jmin - 1 + searchsortedfirst(thisrow_colvals, chunk_left)
-
-            lsolve_col_ranges[c, row] = j_right:-1:j_left
-        end
-    end
-
-    U_colptr = U.colptr
-    U_rowval = U.rowval
-
-    # Get column sizes, which we will use to estimate a sensible chunk size.
-    # Exclude the diagonal from the column sizes, as that is treated specially.
-    col_sizes = U_colptr[2:end] .- U_colptr[1:end-1] .- 1
-    mean_col_size = mean(col_sizes)
-    max_col_size = maximum(col_sizes)
-
-    # Guess a sensible chunk_size to balance communication and computation costs.
-    # Every column will be divided into `rsolve_n_chunks` chunks of size `chunk_size`. For
-    # many columns several chunks will probably be empty, but use the same
-    # `rsolve_n_chunks` and `chunk_size` for every column to guarantee that there are no
-    # race condition errors even though column sizes can vary.
-    if comm_size == 1
-        # Special case - only ever want one chunk as there is no parallelism.
-        chunk_size = m
-    else
-        chunk_size = max(mean_col_size ÷ comm_size, 1)
-    end
-
-    # For rsolve!(), to avoid race conditions the chunks need to be aligned to fixed rows
-    # in the matrix.
-    # First find the maximum number of chunks needed for any column
-    rsolve_chunk_edges = 1:chunk_size:m
-    rsolve_n_chunks = 0
-    for col ∈ 1:n
-        # Indices of super-diagonal values in this column
-        this_minrow = U_rowval[U_colptr[col]]
-        # `U_colptr[col+1]` is the first element of the next column. `U_colptr[row+1]-1`
-        # would be the diagonal element of U, so the '-2' here is to skip that diagonal
-        # element.
-        this_maxrow = U_rowval[max(U_colptr[col+1]-2,1)]
-
-        chunk_minrow = searchsortedlast(rsolve_chunk_edges, this_minrow)
-        chunk_maxrow = searchsortedlast(rsolve_chunk_edges, this_maxrow)
-        rsolve_n_chunks = max(rsolve_n_chunks, chunk_maxrow - chunk_minrow + 1)
-    end
-
-    rsolve_row_ranges = Matrix{StepRange{Int64}}(undef, rsolve_n_chunks, length(rsolve_col_range))
-    rsolve_is_chunk_edge = Vector{Bool}(undef, length(rsolve_col_range))
-    for (mycol_counter,col) ∈ enumerate(rsolve_col_range)
-        # Indices of super-diagonal values in this column
-        jmin = U_colptr[col]
-        # `U_colptr[col+1]` is the first element of the next column. `U_colptr[row+1]-1`
-        # would be the diagonal element of U, so the '-2' here is to skip that diagonal
-        # element.
-        jmax = U_colptr[col+1]-2
-
-        thiscol_rowvals = [U_rowval[j] for j ∈ jmin:jmax]
-
-        # Chunk edges are given by rsolve_chunk_edges. Sort thiscol_rowvals into
-        # chunks.
-        rsolve_is_chunk_edge[mycol_counter] = (col ∈ rsolve_chunk_edges)
-        bottom_chunk = searchsortedlast(rsolve_chunk_edges, col)
-        for c ∈ 1:rsolve_n_chunks
-            this_chunk = bottom_chunk - c + 1
-            if this_chunk ≥ 1
-                if this_chunk == rsolve_n_chunks
-                    chunk_bottom = m
-                else
-                    chunk_bottom = rsolve_chunk_edges[this_chunk+1] - 1
-                end
-                chunk_top = rsolve_chunk_edges[this_chunk]
-            else
-                # No points in this chunk
-                chunk_bottom = 0
-                chunk_top = 1
-            end
-
-            # If the value being searched for is less than all the values in the array,
-            # `searchsortedlast()` returns 0, and `searchsortedfirst()` returns 1, so that
-            # in that case we get an empty range.
-            j_bottom = jmin - 1 + searchsortedlast(thiscol_rowvals, chunk_bottom)
-            j_top = jmin - 1 + searchsortedfirst(thiscol_rowvals, chunk_top)
-
-            rsolve_row_ranges[c, mycol_counter] = j_bottom:-1:j_top
-        end
-    end
-
-    if lsolve_has_first_row
-        # Remove this row from lsolve_row_range as it will be treated specially.
-        lsolve_row_range = lsolve_row_range[2:end]
-    end
-    if lsolve_has_last_row
-        # Remove this row from lsolve_row_range as it will be treated specially.
-        lsolve_row_range = lsolve_row_range[1:end-1]
-    end
-    if rsolve_has_left_col
-        # Remove this col from lsolve_row_range as it will be treated specially.
-        rsolve_col_range = rsolve_col_range[2:end]
-    end
-    if rsolve_has_right_col
-        # Remove this col from lsolve_row_range as it will be treated specially.
-        rsolve_col_range = rsolve_col_range[1:end-1]
-    end
-
-    return ParallelSparseLU(m, n, L, U, p, q, Rs, wrk, lu_object, comm, comm_rank,
-                            comm_size, comm_prev_proc, comm_next_proc, wrk_range,
-                            lsolve_row_range, lsolve_n_chunks, lsolve_col_ranges,
-                            lsolve_has_first_row, lsolve_has_last_row, rsolve_col_range,
-                            rsolve_n_chunks, rsolve_row_ranges, rsolve_has_right_col,
-                            rsolve_has_left_col, MPI_Win_store)
-end
-
-function sharedmem_lu!(F::ParallelSparseLU, A::SparseMatrixCSC)
+function lu!(F::ParallelSparseLU, A::SparseMatrixCSC)
     MPI.Barrier(F.comm)
     if F.comm_rank == 0
         lu!(F.lu_object, A)
