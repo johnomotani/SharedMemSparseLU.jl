@@ -638,15 +638,18 @@ function ldiv!(x::AbstractVector, F::ParallelSparseLU{Tf,Ti},
     # Do the 'forward substitution', storing the result in `x` (here just being used as a
     # temporary array)
     lsolve!(x, F, wrk)
+    MPI.Barrier(comm)
 
     # Do the 'backward substitution', storing the result in `wrk`
     rsolve!(wrk, F, x)
+    MPI.Barrier(comm)
 
     # Un-pivot `x`
     q = F.q
-    for i ∈ 1:n
+    for i ∈ F.wrk_range
         x[q[i]] = wrk[i]
     end
+    MPI.Barrier(comm)
 
     return x
 end
