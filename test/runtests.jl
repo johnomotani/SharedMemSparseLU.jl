@@ -53,19 +53,17 @@ function runtests()
                 A_lu = ParallelSparseLU{Float64,Int64}(A_sparse)
 
                 # Create rhs
-                b, b_win = allocate_shared(comm, Tf, n)
+                b = allocate_shared(A_lu, n)
                 if comm_rank == 0
                     b .= rand(rng, Tf, n)
                 end
-                x, x_win = allocate_shared(comm, Tf, n)
+                x = allocate_shared(A_lu, n)
 
                 lsolve!(x, A_lu, b)
 
                 if comm_rank == 0
                     @test isapprox(x, A_lu.L \ b, rtol=tol, atol=tol)
                 end
-                MPI.free(b_win)
-                MPI.free(x_win)
                 cleanup_ParallelSparseLU!(A_lu)
             end
         end
@@ -82,24 +80,20 @@ function runtests()
                 A_lu = ParallelSparseLU{Float64,Int64}(A_sparse)
 
                 # Create rhs
-                b, b_win = allocate_shared(comm, Tf, n)
-                wrk, wrk_win = allocate_shared(comm, Tf, n)
+                b = allocate_shared(A_lu, n)
+                wrk = allocate_shared(A_lu, n)
                 if comm_rank == 0
                     b .= rand(rng, Tf, n)
                     # rsolve!() will modify its third argument, so work with a copy
                     wrk .= b
                 end
-                x, x_win = allocate_shared(comm, Tf, n)
+                x = allocate_shared(A_lu, n)
 
                 rsolve!(x, A_lu, wrk)
 
                 if comm_rank == 0
                     @test isapprox(x, A_lu.U \ b, rtol=tol, atol=tol)
                 end
-
-                MPI.free(b_win)
-                MPI.free(wrk_win)
-                MPI.free(x_win)
                 cleanup_ParallelSparseLU!(A_lu)
             end
         end
