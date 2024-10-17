@@ -180,6 +180,7 @@ struct ParallelSparseLU{Tf, Ti, TLU <: Union{SparseArrays.UMFPACK.UmfpackLU,Noth
     rsolve_col_range::StepRange{Int64}
     rsolve_n_chunks::Ti
     rsolve_row_ranges::Matrix{StepRange{Int64}}
+    rsolve_is_chunk_edge::Vector{Bool}
     rsolve_has_right_col::Bool
     rsolve_has_left_col::Bool
     MPI_Win_store::MPI_Win_store_struct
@@ -465,7 +466,7 @@ struct ParallelSparseLU{Tf, Ti, TLU <: Union{SparseArrays.UMFPACK.UmfpackLU,Noth
             # Chunk edges are given by rsolve_chunk_edges. Sort thiscol_rowvals into
             # chunks.
             rsolve_is_chunk_edge[mycol_counter] = (col ∈ rsolve_chunk_edges)
-            bottom_chunk = searchsortedlast(rsolve_chunk_edges, col)
+            bottom_chunk = searchsortedlast(rsolve_chunk_edges, col - 1)
             for c ∈ 1:rsolve_n_chunks
                 this_chunk = bottom_chunk - c + 1
                 if this_chunk ≥ 1
@@ -501,11 +502,11 @@ struct ParallelSparseLU{Tf, Ti, TLU <: Union{SparseArrays.UMFPACK.UmfpackLU,Noth
         end
         if rsolve_has_left_col
             # Remove this col from lsolve_row_range as it will be treated specially.
-            rsolve_col_range = rsolve_col_range[2:end]
+            rsolve_col_range = rsolve_col_range[1:end-1]
         end
         if rsolve_has_right_col
             # Remove this col from lsolve_row_range as it will be treated specially.
-            rsolve_col_range = rsolve_col_range[1:end-1]
+            rsolve_col_range = rsolve_col_range[2:end]
         end
 
         return new{Tf, Ti, typeof(lu_object)}(m, n, L, U, p, q, Rs, wrk, lu_object, comm,
@@ -514,8 +515,9 @@ struct ParallelSparseLU{Tf, Ti, TLU <: Union{SparseArrays.UMFPACK.UmfpackLU,Noth
                                               lsolve_n_chunks, lsolve_col_ranges,
                                               lsolve_has_first_row, lsolve_has_last_row,
                                               rsolve_col_range, rsolve_n_chunks,
-                                              rsolve_row_ranges, rsolve_has_right_col,
-                                              rsolve_has_left_col, MPI_Win_store)
+                                              rsolve_row_ranges, rsolve_is_chunk_edge,
+                                              rsolve_has_right_col, rsolve_has_left_col,
+                                              MPI_Win_store)
     end
 end
 
@@ -742,6 +744,7 @@ function rsolve!(x, F::ParallelSparseLU{Tf,Ti}, b) where {Tf,Ti}
     col_range = F.rsolve_col_range
     n_chunks = F.rsolve_n_chunks
     row_ranges = F.rsolve_row_ranges
+    is_chunk_edge = F.rsolve_is_chunk_edge
     comm_next_proc = F.comm_next_proc
     comm_prev_proc = F.comm_prev_proc
 
@@ -775,6 +778,10 @@ function rsolve!(x, F::ParallelSparseLU{Tf,Ti}, b) where {Tf,Ti}
         x[col] = b[col] / nzval[colptr[col+1]-1]
 
         this_row_ranges = @view row_ranges[:,mycol_counter+row_ranges_offset]
+        if is_chunk_edge[mycol_counter]
+            req = MPI.Ibarrier(comm_prev_proc)
+            MPI.Wait(req)
+        end
         for j ∈ this_row_ranges[1]
             row = rowval[j]
             b[row] -= nzval[j] * x[col]
@@ -802,6 +809,12 @@ function rsolve!(x, F::ParallelSparseLU{Tf,Ti}, b) where {Tf,Ti}
 
         # Diagonal entry of L
         x[1] = b[1] / nzval[1]
+        for c ∈ 2:n_chunks
+            # Need to make MPI.Ibarrier() calls to match the ones done by the 'previous'
+            # processor. Otherwise we would wait at the wrong times when we came to the
+            # next call to `ldiv!()`.
+            MPI.Ibarrier(comm_prev_proc)
+        end
     end
 
     return nothing
