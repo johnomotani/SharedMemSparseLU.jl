@@ -37,7 +37,6 @@ function runtests()
 
     @testset "SharedMemSparseLU" begin
         @testset "lsolve! $n" for n ∈ 1:200
-
             if comm_rank == 0
                 # Make a lower-triangular matrix
                 A = rand(rng, Tf, n, n)
@@ -66,8 +65,6 @@ function runtests()
         end
 
         @testset "rsolve! $n" for n ∈ 1:200
-            n = 42
-
             if comm_rank == 0
                 A = rand(rng, Tf, n, n)
                 A_sparse = sparse(A)
@@ -100,8 +97,6 @@ function runtests()
         end
 
         @testset "dense matrix $n" for n ∈ 1:200
-            n = 42
-
             if comm_rank == 0
                 A = rand(rng, Tf, n, n)
                 A_sparse = sparse(A)
