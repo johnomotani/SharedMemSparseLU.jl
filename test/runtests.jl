@@ -1,17 +1,17 @@
 module SharedMemSparseLUTests
 
 using LinearAlgebra
-#using MPI
+using MPI
 using Random
 using SparseArrays
 using SparseMatricesCSR
 using Test
 
 using SharedMemSparseLU
-using SharedMemSparseLU: lsolve!, rsolve!
+using SharedMemSparseLU: allocate_shared, lsolve!, rsolve!
 
 # Get a sparse test matrix with a structure similar to a finite element derivative
-function test_matrix(rng=default_rnk(), nel=6, ngr=5)
+function test_matrix(rng=default_rng(), nel=6, ngr=5)
     n = nel*(ngr-1)+1
     mat = zeros(n,n)
     for iel in 1:nel
@@ -24,132 +24,238 @@ end
 
 function runtests()
 
-    tol = 1.0e-14
-    dense_tol = 6.0e-13
+    MPI.Init()
+    comm = MPI.COMM_WORLD
+    comm_rank = MPI.Comm_rank(comm)
+
+    tol = 1.0e-13
+    dense_tol = 1.0e-11
     Tf = Float64
     Ti = Int64
 
-    rng = MersenneTwister(42)
+    # WARNING: as we use random numbers to generate test data, adding new tests, etc. may
+    # make existing tests fail because the input is bad (e.g. the matrix is nearly
+    # singular). If this happens, it might help to change the seed used to initialise the
+    # random number generator `rng`.
+    rng = MersenneTwister(47)
 
     @testset "SharedMemSparseLU" begin
         @testset "lsolve!" begin
-            n = 42
+            @testset "$n" for n ∈ 2:200
+                if comm_rank == 0
+                    # Make a lower-triangular matrix
+                    A = rand(rng, Tf, n, n)
+                    A_sparse = sparse(A)
+                else
+                    A = nothing
+                    A_sparse = nothing
+                end
+                A_lu = ParallelSparseLU{Float64,Int64}(A_sparse)
 
-            # Make a lower-triangular matrix
-            L = rand(rng, Tf, n, n)
-            for row ∈ 1:n
-                L[row,row] = 1.0
-                L[row,row+1:end] .= 0.0
+                # Create rhs
+                b = allocate_shared(A_lu, n)
+                if comm_rank == 0
+                    b .= rand(rng, Tf, n)
+                end
+                x = allocate_shared(A_lu, n)
+
+                lsolve!(x, A_lu, b)
+                MPI.Barrier(comm)
+
+                if comm_rank == 0
+                    @test isapprox(x, A_lu.L \ b, rtol=tol, atol=tol)
+                end
+                MPI.Barrier(comm)
+                cleanup_ParallelSparseLU!(A_lu)
             end
-            L_sparse = sparsecsr(findnz(sparse(L))...)
-
-            # Create rhs
-            b = rand(rng, Tf, n)
-            x = similar(b)
-
-            lsolve!(x, L_sparse, b)
-
-            @test isapprox(x, L \ b, rtol=tol, atol=tol)
         end
 
         @testset "rsolve!" begin
-            n = 42
+            @testset "$n" for n ∈ 2:200
+                if comm_rank == 0
+                    A = rand(rng, Tf, n, n)
+                    A_sparse = sparse(A)
+                else
+                    A = nothing
+                    A_sparse = nothing
+                end
+                A_lu = ParallelSparseLU{Float64,Int64}(A_sparse)
 
-            # Make an upper-triangular matrix
-            U = rand(rng, Tf, n, n)
-            for row ∈ 1:n
-                U[row,1:row-1] .= 0.0
+                # Create rhs
+                b = allocate_shared(A_lu, n)
+                wrk = allocate_shared(A_lu, n)
+                if comm_rank == 0
+                    b .= rand(rng, Tf, n)
+                    # rsolve!() will modify its third argument, so work with a copy
+                    wrk .= b
+                end
+                x = allocate_shared(A_lu, n)
+
+                rsolve!(x, A_lu, wrk)
+                MPI.Barrier(comm)
+
+                if comm_rank == 0
+                    @test isapprox(x, A_lu.U \ b, rtol=dense_tol, atol=dense_tol)
+                end
+                MPI.Barrier(comm)
+                cleanup_ParallelSparseLU!(A_lu)
             end
-            U_sparse = sparse(U)
-
-            # Create rhs
-            b = rand(rng, Tf, n)
-            # rsolve!() will modify its third argument, so work with a copy
-            wrk = copy(b)
-            x = similar(b)
-
-            rsolve!(x, U_sparse, wrk)
-
-            @test isapprox(x, U \ b, rtol=tol, atol=tol)
         end
 
-        @testset "dense matrix" begin
-            n = 42
+        @testset "dense matrix " begin
+            @testset "$n" for n ∈ 1:200
+                if comm_rank == 0
+                    A = rand(rng, Tf, n, n)
+                    A_sparse = sparse(A)
+                else
+                    A = nothing
+                    A_sparse = nothing
+                end
+                A_lu = ParallelSparseLU{Float64,Int64}(A_sparse)
 
-            A = rand(rng, Tf, n, n)
-            A_sparse = sparse(A)
-            A_lu = sharedmem_lu(A_sparse)
+                # Create rhs
+                b = allocate_shared(A_lu, n)
+                if comm_rank == 0
+                    b .= rand(rng, Tf, n)
+                end
+                x = allocate_shared(A_lu, n)
 
-            # Create rhs
-            b = rand(rng, Tf, n)
-            x = similar(b)
+                ldiv!(x, A_lu, b)
 
-            ldiv!(x, A_lu, b)
+                if comm_rank == 0
+                    @test isapprox(x, A_sparse \ b, rtol=dense_tol, atol=dense_tol)
+                end
+                MPI.Barrier(comm)
 
-            @test isapprox(x, A_sparse \ b, rtol=dense_tol, atol=dense_tol)
+                # Check we can update the rhs
+                if comm_rank == 0
+                    b .= rand(rng, Tf, n)
+                end
+                MPI.Barrier(comm)
 
-            # Check we can update the rhs
-            b .= rand(rng, Tf, n)
+                ldiv!(x, A_lu, b)
+                if comm_rank == 0
+                    @test isapprox(x, A_sparse \ b, rtol=dense_tol, atol=dense_tol)
+                end
+                MPI.Barrier(comm)
 
-            ldiv!(x, A_lu, b)
-            @test isapprox(x, A_sparse \ b, rtol=dense_tol, atol=dense_tol)
+                # Check we can update the matrix
+                if comm_rank == 0
+                    A = rand(rng, Tf, n, n)
+                    A_sparse = sparse(A)
+                else
+                    A = nothing
+                    A_sparse = nothing
+                end
+                lu!(A_lu, A_sparse)
 
-            # Check we can update the matrix
-            A = rand(rng, Tf, n, n)
-            A_sparse = sparse(A)
-            sharedmem_lu!(A_lu, A_sparse)
+                # Create rhs
+                if comm_rank == 0
+                    b .= rand(rng, Tf, n)
+                end
+                MPI.Barrier(comm)
 
-            # Create rhs
-            b .= rand(rng, Tf, n)
+                ldiv!(x, A_lu, b)
 
-            ldiv!(x, A_lu, b)
+                if comm_rank == 0
+                    @test isapprox(x, A_sparse \ b, rtol=dense_tol, atol=dense_tol)
+                end
+                MPI.Barrier(comm)
 
-            @test isapprox(x, A_sparse \ b, rtol=dense_tol, atol=dense_tol)
+                # Check we can update the rhs again
+                if comm_rank == 0
+                    b .= rand(rng, Tf, n)
+                end
+                MPI.Barrier(comm)
 
-            # Check we can update the rhs again
-            b .= rand(rng, Tf, n)
-
-            ldiv!(x, A_lu, b)
-            @test isapprox(x, A_sparse \ b, rtol=dense_tol, atol=dense_tol)
+                ldiv!(x, A_lu, b)
+                if comm_rank == 0
+                    @test isapprox(x, A_sparse \ b, rtol=dense_tol, atol=dense_tol)
+                end
+                MPI.Barrier(comm)
+                cleanup_ParallelSparseLU!(A_lu)
+            end
         end
 
         @testset "sparse matrix" begin
-            A = test_matrix(rng)
+            @testset "$n" for n ∈ 1:200
+                if comm_rank == 0
+                    A = test_matrix(rng)
+                else
+                    A = nothing
+                end
 
-            n = size(A, 1)
+                this_length = Ref(0)
+                if comm_rank == 0
+                    this_length[] = size(A, 1)
+                    MPI.Bcast!(this_length, comm)
+                else
+                    MPI.Bcast!(this_length, comm)
+                end
+                n = this_length[]
 
-            A_lu = sharedmem_lu(A)
+                A_lu = ParallelSparseLU{Float64,Int64}(A)
 
-            # Create rhs
-            b = rand(rng, Tf, n)
-            x = similar(b)
+                # Create rhs
+                b = allocate_shared(A_lu, n)
+                if comm_rank == 0
+                    b .= rand(rng, Tf, n)
+                end
+                x = allocate_shared(A_lu, n)
 
-            ldiv!(x, A_lu, b)
+                ldiv!(x, A_lu, b)
 
-            @test isapprox(x, A \ b, rtol=tol, atol=tol)
+                if comm_rank == 0
+                    @test isapprox(x, A \ b, rtol=tol, atol=tol)
+                end
+                MPI.Barrier(comm)
 
-            # Check we can update the rhs
-            b .= rand(rng, Tf, n)
+                # Check we can update the rhs
+                if comm_rank == 0
+                    b .= rand(rng, Tf, n)
+                end
+                MPI.Barrier(comm)
 
-            ldiv!(x, A_lu, b)
-            @test isapprox(x, A \ b, rtol=tol, atol=tol)
+                ldiv!(x, A_lu, b)
+                if comm_rank == 0
+                    @test isapprox(x, A \ b, rtol=tol, atol=tol)
+                end
+                MPI.Barrier(comm)
 
-            # Check we can update the matrix
-            A = test_matrix(rng)
-            sharedmem_lu!(A_lu, A)
+                # Check we can update the matrix
+                if comm_rank == 0
+                    A = test_matrix(rng)
+                else
+                    A = nothing
+                end
+                lu!(A_lu, A)
 
-            # Create rhs
-            b .= rand(rng, Tf, n)
+                # Create rhs
+                if comm_rank == 0
+                    b .= rand(rng, Tf, n)
+                end
+                MPI.Barrier(comm)
 
-            ldiv!(x, A_lu, b)
+                ldiv!(x, A_lu, b)
 
-            @test isapprox(x, A \ b, rtol=tol, atol=tol)
+                if comm_rank == 0
+                    @test isapprox(x, A \ b, rtol=tol, atol=tol)
+                end
+                MPI.Barrier(comm)
 
-            # Check we can update the rhs again
-            b .= rand(rng, Tf, n)
+                # Check we can update the rhs again
+                if comm_rank == 0
+                    b .= rand(rng, Tf, n)
+                end
+                MPI.Barrier(comm)
 
-            ldiv!(x, A_lu, b)
-            @test isapprox(x, A \ b, rtol=tol, atol=tol)
+                ldiv!(x, A_lu, b)
+                if comm_rank == 0
+                    @test isapprox(x, A \ b, rtol=tol, atol=tol)
+                end
+                MPI.Barrier(comm)
+                cleanup_ParallelSparseLU!(A_lu)
+            end
         end
     end
 end
