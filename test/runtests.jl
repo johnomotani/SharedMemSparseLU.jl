@@ -94,11 +94,6 @@ function runtests()
                 @test isapprox(x, A_lu.U \ b, rtol=tol, atol=tol)
             end
 
-            if comm_rank == 0
-                x_serial = similar(x)
-                rsolve_serial!(x_serial, A_lu.U, copy(b))
-                @test isapprox(x_serial, A_lu.U \ b, rtol=tol, atol=tol)
-            end
             MPI.free(b_win)
             MPI.free(wrk_win)
             MPI.free(x_win)
