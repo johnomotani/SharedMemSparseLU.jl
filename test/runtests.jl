@@ -1,14 +1,14 @@
 module SharedMemSparseLUTests
 
 using LinearAlgebra
-#using MPI
+using MPI
 using Random
 using SparseArrays
 using SparseMatricesCSR
 using Test
 
 using SharedMemSparseLU
-using SharedMemSparseLU: lsolve!, rsolve!
+using SharedMemSparseLU: allocate_shared, lsolve!, rsolve!
 
 # Get a sparse test matrix with a structure similar to a finite element derivative
 function test_matrix(rng=default_rnk(), nel=6, ngr=5)
@@ -24,6 +24,8 @@ end
 
 function runtests()
 
+    MPI.Init()
+
     tol = 1.0e-14
     dense_tol = 6.0e-13
     Tf = Float64
@@ -35,121 +37,211 @@ function runtests()
         @testset "lsolve!" begin
             n = 42
 
-            # Make a lower-triangular matrix
-            L = rand(rng, Tf, n, n)
-            for row ∈ 1:n
-                L[row,row] = 1.0
-                L[row,row+1:end] .= 0.0
-            end
-            L_sparse = sparsecsr(findnz(sparse(L))...)
+            #if block_rank[] == 0
+                # Make a lower-triangular matrix
+                A = rand(rng, Tf, n, n)
+                A_sparse = sparse(A)
+            #else
+            #    A = nothing
+            #    A_sparse = nothing
+            #end
+            A_lu = sharedmem_lu(A_sparse)
 
             # Create rhs
-            b = rand(rng, Tf, n)
-            x = similar(b)
+            b, b_win = allocate_shared(MPI.COMM_WORLD, Tf, n)
+            #@serial_region begin
+                b .= rand(rng, Tf, n)
+            #end
+            x, x_win = allocate_shared(MPI.COMM_WORLD, Tf, n)
+            #MPI.Barrier(MPI.COMM_WORLD)
 
-            lsolve!(x, L_sparse, b)
+            lsolve!(x, A_lu, b)
 
-            @test isapprox(x, L \ b, rtol=tol, atol=tol)
+            #@serial_region begin
+                @test isapprox(x, A_lu.L \ b, rtol=tol, atol=tol)
+            #end
+            MPI.free(b_win)
+            MPI.free(x_win)
         end
 
         @testset "rsolve!" begin
             n = 42
 
-            # Make an upper-triangular matrix
-            U = rand(rng, Tf, n, n)
-            for row ∈ 1:n
-                U[row,1:row-1] .= 0.0
-            end
-            U_sparse = sparse(U)
+            #if block_rank[] == 0
+                A = rand(rng, Tf, n, n)
+                A_sparse = sparse(A)
+            #else
+            #    A = nothing
+            #    A_sparse = nothing
+            #end
+            A_lu = sharedmem_lu(A_sparse)
 
             # Create rhs
-            b = rand(rng, Tf, n)
-            # rsolve!() will modify its third argument, so work with a copy
-            wrk = copy(b)
-            x = similar(b)
+            b, b_win = allocate_shared(MPI.COMM_WORLD, Tf, n)
+            wrk, wrk_win = allocate_shared(MPI.COMM_WORLD, Tf, n)
+            #@serial_region begin
+                b .= rand(rng, Tf, n)
+                # rsolve!() will modify its third argument, so work with a copy
+                wrk .= b
+            #end
+            x, x_win = allocate_shared(MPI.COMM_WORLD, Tf, n)
+            #MPI.Barrier(MPI.COMM_WORLD)
 
-            rsolve!(x, U_sparse, wrk)
+            rsolve!(x, A_lu, wrk)
 
-            @test isapprox(x, U \ b, rtol=tol, atol=tol)
+            #@serial_region begin
+                @test isapprox(x, A_lu.U \ b, rtol=tol, atol=tol)
+            #end
+            MPI.free(b_win)
+            MPI.free(wrk_win)
+            MPI.free(x_win)
         end
 
         @testset "dense matrix" begin
             n = 42
 
-            A = rand(rng, Tf, n, n)
-            A_sparse = sparse(A)
+            #if block_rank[] == 0
+                A = rand(rng, Tf, n, n)
+                A_sparse = sparse(A)
+            #else
+            #    A = nothing
+            #    A_sparse = nothing
+            #end
             A_lu = sharedmem_lu(A_sparse)
 
             # Create rhs
-            b = rand(rng, Tf, n)
-            x = similar(b)
+            b = allocate_shared(A_lu, n)
+            #@serial_region begin
+                b .= rand(rng, Tf, n)
+            #end
+            x = allocate_shared(A_lu, n)
+            #MPI.Barrier(MPI.COMM_WORLD)
 
             ldiv!(x, A_lu, b)
 
-            @test isapprox(x, A_sparse \ b, rtol=dense_tol, atol=dense_tol)
+            #@serial_region begin
+                @test isapprox(x, A_sparse \ b, rtol=dense_tol, atol=dense_tol)
+            #end
 
             # Check we can update the rhs
-            b .= rand(rng, Tf, n)
+            #@serial_region begin
+                b .= rand(rng, Tf, n)
+            #end
+            #MPI.Barrier(MPI.COMM_WORLD)
 
             ldiv!(x, A_lu, b)
-            @test isapprox(x, A_sparse \ b, rtol=dense_tol, atol=dense_tol)
+            #@serial_region begin
+                @test isapprox(x, A_sparse \ b, rtol=dense_tol, atol=dense_tol)
+            #end
 
             # Check we can update the matrix
-            A = rand(rng, Tf, n, n)
-            A_sparse = sparse(A)
+            #if block_rank[] == 0
+                A = rand(rng, Tf, n, n)
+                A_sparse = sparse(A)
+            #else
+            #    A = nothing
+            #    A_sparse = nothing
+            #end
             sharedmem_lu!(A_lu, A_sparse)
 
             # Create rhs
-            b .= rand(rng, Tf, n)
+            #@serial_region begin
+                b .= rand(rng, Tf, n)
+            #end
+            #MPI.Barrier(MPI.COMM_WORLD)
 
             ldiv!(x, A_lu, b)
 
-            @test isapprox(x, A_sparse \ b, rtol=dense_tol, atol=dense_tol)
+            #@serial_region begin
+                @test isapprox(x, A_sparse \ b, rtol=dense_tol, atol=dense_tol)
+            #end
 
             # Check we can update the rhs again
-            b .= rand(rng, Tf, n)
+            #@serial_region begin
+                b .= rand(rng, Tf, n)
+            #end
+            #MPI.Barrier(MPI.COMM_WORLD)
 
             ldiv!(x, A_lu, b)
-            @test isapprox(x, A_sparse \ b, rtol=dense_tol, atol=dense_tol)
+            #@serial_region begin
+                @test isapprox(x, A_sparse \ b, rtol=dense_tol, atol=dense_tol)
+            #end
         end
 
         @testset "sparse matrix" begin
-            A = test_matrix(rng)
+            #if block_rank[] == 0
+                A = test_matrix(rng)
+            #else
+            #    A = nothing
+            #end
 
+            #this_length = Ref(0)
+            #if block_rank[] == 0
+            #    this_length[] = size(A, 1)
+            #    MPI.Bcast!(this_length, comm_block[])
+            #else
+            #    MPI.Bcast!(this_length, comm_block[])
+            #end
+            #n = this_length[]
             n = size(A, 1)
 
             A_lu = sharedmem_lu(A)
 
             # Create rhs
-            b = rand(rng, Tf, n)
-            x = similar(b)
+            b = allocate_shared(A_lu, n)
+            #@serial_region begin
+                b .= rand(rng, Tf, n)
+            #end
+            x = allocate_shared(A_lu, n)
+            #MPI.Barrier(MPI.COMM_WORLD)
 
             ldiv!(x, A_lu, b)
 
-            @test isapprox(x, A \ b, rtol=tol, atol=tol)
+            #@serial_region begin
+                @test isapprox(x, A \ b, rtol=tol, atol=tol)
+            #end
 
             # Check we can update the rhs
-            b .= rand(rng, Tf, n)
+            #@serial_region begin
+                b .= rand(rng, Tf, n)
+            #end
+            #MPI.Barrier(MPI.COMM_WORLD)
 
             ldiv!(x, A_lu, b)
-            @test isapprox(x, A \ b, rtol=tol, atol=tol)
+            #@serial_region begin
+                @test isapprox(x, A \ b, rtol=tol, atol=tol)
+            #end
 
             # Check we can update the matrix
-            A = test_matrix(rng)
+            #if block_rank[] == 0
+                A = test_matrix(rng)
+            #else
+            #    A = nothing
+            #end
             sharedmem_lu!(A_lu, A)
 
             # Create rhs
-            b .= rand(rng, Tf, n)
+            #@serial_region begin
+                b .= rand(rng, Tf, n)
+            #end
+            #MPI.Barrier(MPI.COMM_WORLD)
 
             ldiv!(x, A_lu, b)
 
-            @test isapprox(x, A \ b, rtol=tol, atol=tol)
+            #@serial_region begin
+                @test isapprox(x, A \ b, rtol=tol, atol=tol)
+            #end
 
             # Check we can update the rhs again
-            b .= rand(rng, Tf, n)
+            #@serial_region begin
+                b .= rand(rng, Tf, n)
+            #end
+            #MPI.Barrier(MPI.COMM_WORLD)
 
             ldiv!(x, A_lu, b)
-            @test isapprox(x, A \ b, rtol=tol, atol=tol)
+            #@serial_region begin
+                @test isapprox(x, A \ b, rtol=tol, atol=tol)
+            #end
         end
     end
 end
