@@ -536,7 +536,7 @@ function allocate_shared(F::ParallelSparseLU{Tf,Ti}, dims...; int=false) where {
     return array
 end
 
-function lu!(F::ParallelSparseLU, A::SparseMatrixCSC)
+function lu!(F::ParallelSparseLU, A::Union{SparseMatrixCSC,Nothing})
     MPI.Barrier(F.comm)
     if F.comm_rank == 0
         lu!(F.lu_object, A)
