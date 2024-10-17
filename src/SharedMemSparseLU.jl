@@ -155,7 +155,7 @@ function allocate_shared(comm::MPI.Comm, T, dims...)
     return array, win
 end
 
-struct ParallelSparseLU{Tf, Ti}
+struct ParallelSparseLU{Tf, Ti, TLU <: Union{SparseArrays.UMFPACK.UmfpackLU,Nothing}}
     m::Ti
     n::Ti
     L::SparseMatrixCSR{1,Tf,Ti}
@@ -165,7 +165,7 @@ struct ParallelSparseLU{Tf, Ti}
     Rs::Vector{Tf}
     wrk::Vector{Tf}
     # Keep the object created by `lu()` so that we can do in-place updates.
-    lu_object::SparseArrays.UMFPACK.UmfpackLU{Tf,Ti}
+    lu_object::TLU
     comm::MPI.Comm
     comm_rank::Ti
     comm_size::Ti
@@ -239,6 +239,7 @@ struct ParallelSparseLU{Tf, Ti}
             this_length[] = n
             MPI.Bcast!(this_length, comm)
         else
+            lu_object = nothing
             MPI.Bcast!(this_length, comm)
             m = this_length[]
             MPI.Bcast!(this_length, comm)
@@ -379,7 +380,7 @@ struct ParallelSparseLU{Tf, Ti}
             chunk_size = n
             lsolve_n_chunks = 1
         else
-            chunk_size = max(mean_row_size ÷ comm_size, 1)
+            chunk_size = max(round(Ti, mean_row_size) ÷ comm_size, 1)
             lsolve_n_chunks = (max_row_size + chunk_size - 1) ÷ chunk_size
         end
 
@@ -406,7 +407,7 @@ struct ParallelSparseLU{Tf, Ti}
                 j_right = jmin - 1 + searchsortedlast(thisrow_colvals, chunk_right)
                 j_left = jmin - 1 + searchsortedfirst(thisrow_colvals, chunk_left)
 
-                lsolve_col_ranges[c, row] = j_right:-1:j_left
+                lsolve_col_ranges[c, myrow_counter] = j_right:-1:j_left
             end
         end
 
@@ -507,12 +508,14 @@ struct ParallelSparseLU{Tf, Ti}
             rsolve_col_range = rsolve_col_range[1:end-1]
         end
 
-        return new(m, n, L, U, p, q, Rs, wrk, lu_object, comm, comm_rank, comm_size,
-                   comm_prev_proc, comm_next_proc, wrk_range, lsolve_row_range,
-                   lsolve_n_chunks, lsolve_col_ranges, lsolve_has_first_row,
-                   lsolve_has_last_row, rsolve_col_range, rsolve_n_chunks,
-                   rsolve_row_ranges, rsolve_has_right_col, rsolve_has_left_col,
-                   MPI_Win_store)
+        return new{Tf, Ti, typeof(lu_object)}(m, n, L, U, p, q, Rs, wrk, lu_object, comm,
+                                              comm_rank, comm_size, comm_prev_proc,
+                                              comm_next_proc, wrk_range, lsolve_row_range,
+                                              lsolve_n_chunks, lsolve_col_ranges,
+                                              lsolve_has_first_row, lsolve_has_last_row,
+                                              rsolve_col_range, rsolve_n_chunks,
+                                              rsolve_row_ranges, rsolve_has_right_col,
+                                              rsolve_has_left_col, MPI_Win_store)
     end
 end
 
