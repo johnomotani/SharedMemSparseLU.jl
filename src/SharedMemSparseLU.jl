@@ -130,7 +130,8 @@ with `F`. Unfortunately this cannot be done with a 'finalizer', because Julia's 
 are called by the garbage collector, and so may not be called at the same time on all MPI
 ranks, which could lead to errors.
 """
-struct ParallelSparseLU{Tf, Ti, TLU <: Union{SparseArrays.UMFPACK.UmfpackLU,Nothing}}
+mutable struct ParallelSparseLU{Tf, Ti,
+                                TLU <: Union{SparseArrays.UMFPACK.UmfpackLU,Nothing}}
     m::Ti
     n::Ti
     L::SparseMatrixCSR{1,Tf,Ti}
@@ -159,6 +160,7 @@ struct ParallelSparseLU{Tf, Ti, TLU <: Union{SparseArrays.UMFPACK.UmfpackLU,Noth
     rsolve_has_right_col::Bool
     rsolve_has_left_col::Bool
     MPI_Win_store::Vector{MPI.Win}
+    MPI_Win_store_internal::Vector{MPI.Win}
 
     function ParallelSparseLU{Tf,Ti}(A::Union{SparseMatrixCSC{Tf,Ti},Nothing},
                                      comm=MPI.COMM_WORLD) where {Tf,Ti}
@@ -202,6 +204,7 @@ struct ParallelSparseLU{Tf, Ti, TLU <: Union{SparseArrays.UMFPACK.UmfpackLU,Noth
         end
 
         MPI_Win_store = MPI.Win[]
+        MPI_Win_store_internal = MPI.Win[]
 
         this_length = Ref(0)
 
@@ -232,7 +235,7 @@ struct ParallelSparseLU{Tf, Ti, TLU <: Union{SparseArrays.UMFPACK.UmfpackLU,Noth
             MPI.Bcast!(this_length, comm)
         end
         L_rowptr, win = allocate_shared(comm, Ti, this_length[])
-        push!(MPI_Win_store, win)
+        push!(MPI_Win_store_internal, win)
 
         if comm_rank == 0
             this_length[] = length(L_serial.colval)
@@ -241,9 +244,9 @@ struct ParallelSparseLU{Tf, Ti, TLU <: Union{SparseArrays.UMFPACK.UmfpackLU,Noth
             MPI.Bcast!(this_length, comm)
         end
         L_colval, win = allocate_shared(comm, Ti, this_length[])
-        push!(MPI_Win_store, win)
+        push!(MPI_Win_store_internal, win)
         L_nzval, win = allocate_shared(comm, Tf, this_length[])
-        push!(MPI_Win_store, win)
+        push!(MPI_Win_store_internal, win)
 
         if comm_rank == 0
             L_rowptr .= L_serial.rowptr
@@ -265,7 +268,7 @@ struct ParallelSparseLU{Tf, Ti, TLU <: Union{SparseArrays.UMFPACK.UmfpackLU,Noth
             MPI.Bcast!(this_length, comm)
         end
         U_colptr, win = allocate_shared(comm, Ti, this_length[])
-        push!(MPI_Win_store, win)
+        push!(MPI_Win_store_internal, win)
 
         if comm_rank == 0
             this_length[] = length(U_serial.rowval)
@@ -274,9 +277,9 @@ struct ParallelSparseLU{Tf, Ti, TLU <: Union{SparseArrays.UMFPACK.UmfpackLU,Noth
             MPI.Bcast!(this_length, comm)
         end
         U_rowval, win = allocate_shared(comm, Ti, this_length[])
-        push!(MPI_Win_store, win)
+        push!(MPI_Win_store_internal, win)
         U_nzval, win = allocate_shared(comm, Tf, this_length[])
-        push!(MPI_Win_store, win)
+        push!(MPI_Win_store_internal, win)
 
         if comm_rank == 0
             U_colptr .= U_serial.colptr
@@ -287,6 +290,8 @@ struct ParallelSparseLU{Tf, Ti, TLU <: Union{SparseArrays.UMFPACK.UmfpackLU,Noth
 
         U = SparseMatrixCSC(m, n, U_colptr, U_rowval, U_nzval)
 
+        # p, q, Rs, and wrk never change size, so store their windows in the non-internal
+        # MPI_Win_store which is only emptied by cleanup_ParallelSparseLU!().
         p, win = allocate_shared(comm, Ti, m)
         push!(MPI_Win_store, win)
         q, win = allocate_shared(comm, Ti, m)
@@ -492,19 +497,25 @@ struct ParallelSparseLU{Tf, Ti, TLU <: Union{SparseArrays.UMFPACK.UmfpackLU,Noth
                                               rsolve_col_range, rsolve_n_chunks,
                                               rsolve_row_ranges, rsolve_is_chunk_edge,
                                               rsolve_has_right_col, rsolve_has_left_col,
-                                              MPI_Win_store)
+                                              MPI_Win_store, MPI_Win_store_internal)
     end
 end
 
 function cleanup_ParallelSparseLU!(F::ParallelSparseLU)
+    for win ∈ F.MPI_Win_store_internal
+        MPI.free(win)
+    end
+    empty!(F.MPI_Win_store_internal)
     for win ∈ F.MPI_Win_store
         MPI.free(win)
     end
+    empty!(F.MPI_Win_store)
     return nothing
 end
 
 """
-    allocate_shared(F::ParallelSparseLU{Tf,Ti}, dims...; int=false) where {Tf,Ti}
+    allocate_shared(F::ParallelSparseLU{Tf,Ti}, dims...; int=false,
+                    external=true) where {Tf,Ti}
 
 Get a shared-memory array of `T` (shared by all processes in the MPI communicator of `F`).
 
@@ -518,8 +529,12 @@ function.
 
 By default, creates an array of floats of type `Tf`. Pass `int=true` to instead create an
 array of integers of type `Ti`.
+
+`external` is a keyword for internal use of the library only, and should not be passed by
+users.
 """
-function allocate_shared(F::ParallelSparseLU{Tf,Ti}, dims...; int=false) where {Tf,Ti}
+function allocate_shared(F::ParallelSparseLU{Tf,Ti}, dims...; int=false,
+                         external=true) where {Tf,Ti}
     if int
         T = Ti
     else
@@ -531,31 +546,112 @@ function allocate_shared(F::ParallelSparseLU{Tf,Ti}, dims...; int=false) where {
     # Don't think `win::MPI.Win` knows about the type of the pointer (it prints as
     # something like `MPI.Win(Ptr{Nothing} @0x00000000033affd0)`), so it's fine to put
     # them all in the same global_Win_store - this won't introduce type instability
-    push!(F.MPI_Win_store, win)
+    if external
+        push!(F.MPI_Win_store, win)
+    else
+        push!(F.MPI_Win_store_internal, win)
+    end
 
     return array
 end
 
 function lu!(F::ParallelSparseLU, A::Union{SparseMatrixCSC,Nothing})
-    MPI.Barrier(F.comm)
+    comm = F.comm
+    MPI.Barrier(comm)
     if F.comm_rank == 0
         lu!(F.lu_object, A)
         new_L = get_L_matrix_CSR(F.lu_object)
-        F.L.colval .= new_L.colval
-        F.L.rowptr .= new_L.rowptr
-        F.L.nzval .= new_L.nzval
-
         new_U = F.lu_object.U
-        F.U.rowval .= new_U.rowval
-        F.U.colptr .= new_U.colptr
-        F.U.nzval .= new_U.nzval
+
+        # If any arrays changed size then we need to reallocate the arrays
+        reallocate = Ref(size(F.L.colval) != size(new_L.colval)
+                         || size(F.L.rowptr) != size(new_L.rowptr)
+                         || size(F.L.nzval) != size(new_L.nzval)
+                         || size(F.U.rowval) != size(new_U.rowval)
+                         || size(F.U.colptr) != size(new_U.colptr)
+                         || size(F.U.nzval) != size(new_U.nzval)
+                        )
+        MPI.Bcast!(reallocate, comm)
+        if reallocate[]
+            # Probably not actually necessary to reallocate all arrays in L and U, but
+            # simpler this way as we can empty F.MPI_Win_store_internal to ensure we do
+            # not leak memory.
+            for win ∈ F.MPI_Win_store_internal
+                MPI.free(win)
+            end
+            empty!(F.MPI_Win_store_internal)
+
+            this_length = Ref(length(new_L.colval))
+            MPI.Bcast!(this_length, comm)
+            new_L_colval = allocate_shared(F, this_length[]; int=true, external=false)
+            this_length = Ref(length(new_L.rowptr))
+            MPI.Bcast!(this_length, comm)
+            new_L_rowptr = allocate_shared(F, this_length[]; int=true, external=false)
+            this_length = Ref(length(new_L.nzval))
+            MPI.Bcast!(this_length, comm)
+            new_L_nzval = allocate_shared(F, this_length[]; external=false)
+            new_L_colval .= new_L.colval
+            new_L_rowptr .= new_L.rowptr
+            new_L_nzval .= new_L.nzval
+            MPI.Barrier(comm)
+            F.L = SparseMatrixCSR{1}(F.m, F.n, new_L_rowptr, new_L_colval, new_L_nzval)
+
+            this_length = Ref(length(new_U.rowval))
+            MPI.Bcast!(this_length, comm)
+            new_U_rowval = allocate_shared(F, this_length[]; int=true, external=false)
+            this_length = Ref(length(new_U.colptr))
+            MPI.Bcast!(this_length, comm)
+            new_U_colptr = allocate_shared(F, this_length[]; int=true, external=false)
+            this_length = Ref(length(new_U.nzval))
+            MPI.Bcast!(this_length, comm)
+            new_U_nzval = allocate_shared(F, this_length[]; external=false)
+            new_U_rowval .= new_U.rowval
+            new_U_colptr .= new_U.colptr
+            new_U_nzval .= new_U.nzval
+            MPI.Barrier(comm)
+            F.U = SparseMatrixCSR{1}(F.m, F.n, new_U_colptr, new_U_rowval, new_U_nzval)
+        else
+            F.L.colval .= new_L.colval
+            F.L.rowptr .= new_L.rowptr
+            F.L.nzval .= new_L.nzval
+
+            F.U.rowval .= new_U.rowval
+            F.U.colptr .= new_U.colptr
+            F.U.nzval .= new_U.nzval
+        end
 
         F.p .= F.lu_object.p
         F.q .= F.lu_object.q
 
         F.Rs .= F.lu_object.Rs
+    else
+        reallocate = Ref(false)
+        MPI.Bcast!(reallocate, comm)
+        if reallocate[]
+            for win ∈ F.MPI_Win_store_internal
+                MPI.free(win)
+            end
+            empty!(F.MPI_Win_store_internal)
+
+            this_length = Ref(0)
+            MPI.Bcast!(this_length, comm)
+            new_L_colval = allocate_shared(F, this_length[]; int=true, external=false)
+            MPI.Bcast!(this_length, comm)
+            new_L_rowptr = allocate_shared(F, this_length[]; int=true, external=false)
+            MPI.Bcast!(this_length, comm)
+            new_L_nzval = allocate_shared(F, this_length[]; external=false)
+            F.L = SparseMatrixCSR{1}(F.m, F.n, new_L_rowptr, new_L_colval, new_L_nzval)
+
+            MPI.Bcast!(this_length, comm)
+            new_U_rowval = allocate_shared(F, this_length[]; int=true, external=false)
+            MPI.Bcast!(this_length, comm)
+            new_U_colptr = allocate_shared(F, this_length[]; int=true, external=false)
+            MPI.Bcast!(this_length, comm)
+            new_U_nzval = allocate_shared(F, this_length[]; external=false)
+            F.U = SparseMatrixCSR{1}(F.m, F.n, new_U_rowptr, new_U_colval, new_U_nzval)
+        end
     end
-    MPI.Barrier(F.comm)
+    MPI.Barrier(comm)
     return nothing
 end
 
@@ -570,7 +666,8 @@ function ldiv!(x::AbstractVector, F::ParallelSparseLU{Tf,Ti},
     @boundscheck length(x) == F.n || throw(DimensionMismatch("`x` does not have same size as F: length(x)=$(length(x)), F.n=$(F.n)"))
     @boundscheck length(b) == F.n || throw(DimensionMismatch("`b` does not have same size as F: length(b)=$(length(b)), F.n=$(F.n)"))
 
-    if F.m == F.n == 1
+    n = F.n
+    if F.m == n == 1
         # This special case would mess up communication patterns if comm_size>1, so handle
         # it here.
         x[1] = b[1] / F.U[1,1]
@@ -603,7 +700,6 @@ function ldiv!(x::AbstractVector, F::ParallelSparseLU{Tf,Ti},
     # which is then LU factorised as
     #     F.L * F.U * x[F.q] = (F.Rs .* b)[F.p]
 
-    n = F.n
     wrk = F.wrk
     comm = F.comm
 
@@ -613,7 +709,8 @@ function ldiv!(x::AbstractVector, F::ParallelSparseLU{Tf,Ti},
     # argument
     p = F.p
     Rs = F.Rs
-    for i ∈ F.wrk_range
+    wrk_range = F.wrk_range
+    for i ∈ wrk_range
         permuted_ind = p[i]
         wrk[i] = Rs[permuted_ind] * b[permuted_ind]
     end
@@ -630,7 +727,7 @@ function ldiv!(x::AbstractVector, F::ParallelSparseLU{Tf,Ti},
 
     # Un-pivot `x`
     q = F.q
-    for i ∈ F.wrk_range
+    for i ∈ wrk_range
         x[q[i]] = wrk[i]
     end
     MPI.Barrier(comm)
@@ -649,7 +746,6 @@ function lsolve!(x, F::ParallelSparseLU{Tf,Ti}, b) where {Tf,Ti}
 
     L = F.L
     colval = L.colval
-    rowptr = L.rowptr
     nzval = L.nzval
     row_range = F.lsolve_row_range
     n_chunks = F.lsolve_n_chunks
