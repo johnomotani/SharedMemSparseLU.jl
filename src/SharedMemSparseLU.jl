@@ -60,7 +60,7 @@ Pure-Julia implementation of LU algorithms for sparse matrices
 """
 module SharedMemSparseLU
 
-export ParallelSparseLU
+export ParallelSparseLU, cleanup_ParallelSparseLU!
 
 using LinearAlgebra
 using MPI
@@ -71,38 +71,6 @@ using StatsBase: mean
 
 import Base: getindex, setindex!, size, sizehint!, resize!
 import LinearAlgebra: ldiv!, lu!
-
-# Define this mutable struct so that we can give it a finalizer
-mutable struct MPI_Win_store_struct <: AbstractVector{MPI.Win}
-    win_store::Vector{MPI.Win}
-    function MPI_Win_store_struct(v=MPI.Win[])
-        win_store = new(v)
-
-        # Release memory from any shared-memory arrays associated with sharedmem_lu_object.
-        finalizer(win_store) do x
-            for win ∈ win_store.win_store
-                MPI.free(win)
-            end
-        end
-
-        return win_store
-    end
-end
-function getindex(v::MPI_Win_store_struct, args...; kwargs...)
-    return getindex(v.win_store, args...; kwargs...)
-end
-function setindex!(v::MPI_Win_store_struct, args...; kwargs...)
-    return setindex!(v.win_store, args...; kwargs...)
-end
-function size(v::MPI_Win_store_struct, args...; kwargs...)
-    return size(v.win_store, args...; kwargs...)
-end
-function sizehint!(v::MPI_Win_store_struct, args...; kwargs...)
-    return sizehint!(v.win_store, args...; kwargs...)
-end
-function resize!(v::MPI_Win_store_struct, args...; kwargs...)
-    return resize!(v.win_store, args...; kwargs...)
-end
 
 # Ideally this functionality would be provided by SparseArrays.jl, but probably will not b
 # because that package does not define/include a SparseMatrixCSR type. As a workaround,
@@ -155,6 +123,13 @@ function allocate_shared(comm::MPI.Comm, T, dims...)
     return array, win
 end
 
+"""
+Note that you must call `cleanup_ParallelSparseLU!(F)` when you are done with a
+`ParallelSparseLU` object `F` in order to free the MPI-shared-memory arrays associated
+with `F`. Unfortunately this cannot be done with a 'finalizer', because Julia's finalizers
+are called by the garbage collector, and so may not be called at the same time on all MPI
+ranks, which could lead to errors.
+"""
 struct ParallelSparseLU{Tf, Ti, TLU <: Union{SparseArrays.UMFPACK.UmfpackLU,Nothing}}
     m::Ti
     n::Ti
@@ -183,7 +158,7 @@ struct ParallelSparseLU{Tf, Ti, TLU <: Union{SparseArrays.UMFPACK.UmfpackLU,Noth
     rsolve_is_chunk_edge::Vector{Bool}
     rsolve_has_right_col::Bool
     rsolve_has_left_col::Bool
-    MPI_Win_store::MPI_Win_store_struct
+    MPI_Win_store::Vector{MPI.Win}
 
     function ParallelSparseLU{Tf,Ti}(A::Union{SparseMatrixCSC{Tf,Ti},Nothing},
                                      comm=MPI.COMM_WORLD) where {Tf,Ti}
@@ -226,7 +201,7 @@ struct ParallelSparseLU{Tf, Ti, TLU <: Union{SparseArrays.UMFPACK.UmfpackLU,Noth
             end
         end
 
-        MPI_Win_store = MPI_Win_store_struct()
+        MPI_Win_store = MPI.Win[]
 
         this_length = Ref(0)
 
@@ -519,6 +494,13 @@ struct ParallelSparseLU{Tf, Ti, TLU <: Union{SparseArrays.UMFPACK.UmfpackLU,Noth
                                               rsolve_has_right_col, rsolve_has_left_col,
                                               MPI_Win_store)
     end
+end
+
+function cleanup_ParallelSparseLU!(F::ParallelSparseLU)
+    for win ∈ F.MPI_Win_store
+        MPI.free(win)
+    end
+    return nothing
 end
 
 """
