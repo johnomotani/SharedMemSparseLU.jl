@@ -761,19 +761,21 @@ function rsolve!(x, F::ParallelSparseLU{Tf,Ti}, b) where {Tf,Ti}
 
         this_row_ranges = @view row_ranges[:,mycol_counter+row_ranges_offset]
         if is_chunk_edge[mycol_counter]
-            req = MPI.Ibarrier(comm_prev_proc)
-            MPI.Wait(req)
-        end
-        for j ∈ this_row_ranges[1]
-            row = rowval[j]
-            b[row] -= nzval[j] * x[col]
-        end
-        for c ∈ 2:n_chunks
-            # Need to wait for previous process to finish its corresponding chunk before
-            # starting to compute these chunks.
-            req = MPI.Ibarrier(comm_prev_proc)
-            MPI.Wait(req)
-            for j ∈ this_row_ranges[c]
+            for c ∈ 1:n_chunks-1
+                # Need to wait for previous process to finish its corresponding chunk before
+                # starting to compute these chunks.
+                req = MPI.Ibarrier(comm_prev_proc)
+                MPI.Wait(req)
+                for j ∈ this_row_ranges[c]
+                    row = rowval[j]
+                    b[row] -= nzval[j] * x[col]
+                end
+                # Signal to next process that it can start its corresponding chunk now.
+                # Use MPI.Ibarrier() because this process does not need to wait for the next
+                # process to reach this barrier.
+                MPI.Ibarrier(comm_next_proc)
+            end
+            for j ∈ this_row_ranges[end]
                 row = rowval[j]
                 b[row] -= nzval[j] * x[col]
             end
@@ -781,6 +783,29 @@ function rsolve!(x, F::ParallelSparseLU{Tf,Ti}, b) where {Tf,Ti}
             # Use MPI.Ibarrier() because this process does not need to wait for the next
             # process to reach this barrier.
             MPI.Ibarrier(comm_next_proc)
+        else
+            for j ∈ this_row_ranges[1]
+                row = rowval[j]
+                b[row] -= nzval[j] * x[col]
+            end
+            # Signal to next process that it can start its corresponding chunk now.
+            # Use MPI.Ibarrier() because this process does not need to wait for the next
+            # process to reach this barrier.
+            MPI.Ibarrier(comm_next_proc)
+            for c ∈ 2:n_chunks
+                # Need to wait for previous process to finish its corresponding chunk before
+                # starting to compute these chunks.
+                req = MPI.Ibarrier(comm_prev_proc)
+                MPI.Wait(req)
+                for j ∈ this_row_ranges[c]
+                    row = rowval[j]
+                    b[row] -= nzval[j] * x[col]
+                end
+                # Signal to next process that it can start its corresponding chunk now.
+                # Use MPI.Ibarrier() because this process does not need to wait for the next
+                # process to reach this barrier.
+                MPI.Ibarrier(comm_next_proc)
+            end
         end
     end
     if F.rsolve_has_left_col
