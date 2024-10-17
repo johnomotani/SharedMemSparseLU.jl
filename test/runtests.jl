@@ -63,6 +63,7 @@ function runtests()
             end
             MPI.free(b_win)
             MPI.free(x_win)
+            cleanup_ParallelSparseLU!(A_lu)
         end
 
         @testset "rsolve!" begin
@@ -92,15 +93,16 @@ function runtests()
             if comm_rank == 0
                 @test isapprox(x, A_lu.U \ b, rtol=tol, atol=tol)
             end
-            MPI.free(b_win)
-            MPI.free(wrk_win)
-            MPI.free(x_win)
 
             if comm_rank == 0
                 x_serial = similar(x)
                 rsolve_serial!(x_serial, A_lu.U, copy(b))
                 @test isapprox(x_serial, A_lu.U \ b, rtol=tol, atol=tol)
             end
+            MPI.free(b_win)
+            MPI.free(wrk_win)
+            MPI.free(x_win)
+            cleanup_ParallelSparseLU!(A_lu)
         end
 
         @testset "dense matrix" begin
@@ -171,6 +173,7 @@ function runtests()
             if comm_rank == 0
                 @test isapprox(x, A_sparse \ b, rtol=dense_tol, atol=dense_tol)
             end
+            cleanup_ParallelSparseLU!(A_lu)
         end
 
         @testset "sparse matrix" begin
@@ -245,6 +248,7 @@ function runtests()
             if comm_rank == 0
                 @test isapprox(x, A \ b, rtol=tol, atol=tol)
             end
+            cleanup_ParallelSparseLU!(A_lu)
         end
     end
 end
