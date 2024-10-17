@@ -670,7 +670,7 @@ function ldiv!(x::AbstractVector, F::ParallelSparseLU{Tf,Ti},
     if F.m == n == 1
         # This special case would mess up communication patterns if comm_size>1, so handle
         # it here.
-        x[1] = b[1] / F.U[1,1]
+        x[1] = b[1] / F.U[1,1] * F.Rs[1]
         return x
     end
 
