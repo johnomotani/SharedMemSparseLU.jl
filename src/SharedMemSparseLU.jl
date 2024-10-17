@@ -224,6 +224,8 @@ mutable struct ParallelSparseLU{Tf, Ti,
             MPI.Bcast!(this_length, comm)
             n = this_length[]
         end
+        m = Ti(m)
+        n = Ti(n)
 
         # Allocate and fill the L SparseMatrixCSR object
         ################################################
@@ -308,186 +310,11 @@ mutable struct ParallelSparseLU{Tf, Ti,
         wrk, win = allocate_shared(comm, Tf, m)
         push!(MPI_Win_store, win)
 
-        # Get a sub-range for this process to iterate over in `wrk` from a global index range.
-        # Define chunk_size so that comm_size*chunk_size ≥ m, with equality if comm_size
-        # divides m exactly.
-        chunk_size = (m + comm_size - 1) ÷ comm_size
-        imin = comm_rank * chunk_size + 1
-        imax = min((comm_rank + 1) * chunk_size + 1 - 1, m)
-        wrk_range = imin:imax
-
-        lsolve_row_range = 1+comm_rank:comm_size:m
-        if 1 ∈ lsolve_row_range
-            lsolve_has_first_row = true
-        else
-            lsolve_has_first_row = false
-        end
-        if n ∈ lsolve_row_range
-            lsolve_has_last_row = true
-        else
-            lsolve_has_last_row = false
-        end
-
-        rsolve_col_range = n-comm_rank:-comm_size:1
-        if 1 ∈ rsolve_col_range
-            rsolve_has_left_col = true
-        else
-            rsolve_has_left_col = false
-        end
-        if n ∈ rsolve_col_range
-            rsolve_has_right_col = true
-        else
-            rsolve_has_right_col = false
-        end
-
-        MPI.Barrier(comm)
-
-        L_rowptr = L.rowptr
-        L_colval = L.colval
-
-        # Get row sizes, which we will use to estimate a sensible chunk size.
-        # Exclude the diagonal from the row sizes, as that is treated specially.
-        row_sizes = L_rowptr[2:end] .- L_rowptr[1:end-1] .- 1
-        mean_row_size = mean(row_sizes)
-        max_row_size = maximum(row_sizes)
-
-        # Guess a sensible chunk_size to balance communication and computation costs.
-        # Every row will be divided into `lsolve_n_chunks` chunks of size `chunk_size`. For
-        # many rows several chunks will probably be empty, but use the same `lsolve_n_chunks`
-        # and `chunk_size` for every row to guarantee that there are no race condition errors
-        # even though row sizes can vary.
-        if comm_size == 1
-            # Special case - only ever want one chunk as there is no parallelism.
-            chunk_size = n
-            lsolve_n_chunks = 1
-        else
-            chunk_size = max(round(Ti, mean_row_size) ÷ comm_size, 1)
-            lsolve_n_chunks = (max_row_size + chunk_size - 1) ÷ chunk_size
-        end
-
-        lsolve_col_ranges = Matrix{UnitRange{Int64}}(undef, lsolve_n_chunks, length(lsolve_row_range))
-
-        for (myrow_counter,row) ∈ enumerate(lsolve_row_range)
-            # Indices of sub-diagonal values in this row
-            jmin = L_rowptr[row]
-            # `L_rowptr[row+1]` is the first element of the next row. `L_rowptr[row+1]-1`
-            # would be the diagonal element of L, so the '-2' here is to skip that
-            # diagonal element.
-            jmax = L_rowptr[row+1]-2
-
-            thisrow_colvals = [L_colval[j] for j ∈ jmin:jmax]
-
-            for c ∈ 1:lsolve_n_chunks
-                # Chunks are created left-to-right
-                chunk_left = row - (lsolve_n_chunks - c + 1)*chunk_size
-                chunk_right = row - (lsolve_n_chunks - c)*chunk_size - 1
-
-                # If the value being searched for is less than all the values in the array,
-                # `searchsortedlast()` returns 0, and `searchsortedfirst()` returns 1, so that
-                # in that case we get an empty range.
-                j_left = jmin - 1 + searchsortedfirst(thisrow_colvals, chunk_left)
-                j_right = jmin - 1 + searchsortedlast(thisrow_colvals, chunk_right)
-
-                lsolve_col_ranges[c, myrow_counter] = j_left:j_right
-            end
-        end
-
-        U_colptr = U.colptr
-        U_rowval = U.rowval
-
-        # Get column sizes, which we will use to estimate a sensible chunk size.
-        # Exclude the diagonal from the column sizes, as that is treated specially.
-        col_sizes = U_colptr[2:end] .- U_colptr[1:end-1] .- 1
-        mean_col_size = round(Ti, mean(col_sizes))
-        max_col_size = maximum(col_sizes)
-
-        # Guess a sensible chunk_size to balance communication and computation costs.
-        # Every column will be divided into `rsolve_n_chunks` chunks of size `chunk_size`. For
-        # many columns several chunks will probably be empty, but use the same
-        # `rsolve_n_chunks` and `chunk_size` for every column to guarantee that there are no
-        # race condition errors even though column sizes can vary.
-        if comm_size == 1
-            # Special case - only ever want one chunk as there is no parallelism.
-            chunk_size = m
-        else
-            chunk_size = max(mean_col_size ÷ comm_size, 1)
-        end
-
-        # For rsolve!(), to avoid race conditions the chunks need to be aligned to fixed rows
-        # in the matrix.
-        # First find the maximum number of chunks needed for any column
-        rsolve_chunk_edges = 1:chunk_size:m
-        rsolve_n_chunks = 0
-        for col ∈ 1:n
-            # Indices of super-diagonal values in this column
-            this_minrow = U_rowval[U_colptr[col]]
-            # `U_colptr[col+1]` is the first element of the next column. `U_colptr[row+1]-1`
-            # would be the diagonal element of U, so the '-2' here is to skip that diagonal
-            # element.
-            this_maxrow = U_rowval[max(U_colptr[col+1]-2,1)]
-
-            chunk_minrow = searchsortedlast(rsolve_chunk_edges, this_minrow)
-            chunk_maxrow = searchsortedlast(rsolve_chunk_edges, this_maxrow)
-            rsolve_n_chunks = max(rsolve_n_chunks, chunk_maxrow - chunk_minrow + 1)
-        end
-
-        rsolve_row_ranges = Matrix{StepRange{Int64}}(undef, rsolve_n_chunks, length(rsolve_col_range))
-        rsolve_is_chunk_edge = Vector{Bool}(undef, length(rsolve_col_range))
-        for (mycol_counter,col) ∈ enumerate(rsolve_col_range)
-            # Indices of super-diagonal values in this column
-            jmin = U_colptr[col]
-            # `U_colptr[col+1]` is the first element of the next column. `U_colptr[row+1]-1`
-            # would be the diagonal element of U, so the '-2' here is to skip that diagonal
-            # element.
-            jmax = U_colptr[col+1]-2
-
-            thiscol_rowvals = [U_rowval[j] for j ∈ jmin:jmax]
-
-            # Chunk edges are given by rsolve_chunk_edges. Sort thiscol_rowvals into
-            # chunks.
-            rsolve_is_chunk_edge[mycol_counter] = (col ∈ rsolve_chunk_edges)
-            bottom_chunk = searchsortedlast(rsolve_chunk_edges, col - 1)
-            for c ∈ 1:rsolve_n_chunks
-                this_chunk = bottom_chunk - c + 1
-                if this_chunk ≥ 1
-                    if this_chunk == length(rsolve_chunk_edges)
-                        chunk_bottom = m
-                    else
-                        chunk_bottom = rsolve_chunk_edges[this_chunk+1] - 1
-                    end
-                    chunk_top = rsolve_chunk_edges[this_chunk]
-                else
-                    # No points in this chunk
-                    chunk_bottom = 0
-                    chunk_top = 1
-                end
-
-                # If the value being searched for is less than all the values in the array,
-                # `searchsortedlast()` returns 0, and `searchsortedfirst()` returns 1, so that
-                # in that case we get an empty range.
-                j_bottom = jmin - 1 + searchsortedlast(thiscol_rowvals, chunk_bottom)
-                j_top = jmin - 1 + searchsortedfirst(thiscol_rowvals, chunk_top)
-
-                rsolve_row_ranges[c, mycol_counter] = j_bottom:-1:j_top
-            end
-        end
-
-        if lsolve_has_first_row
-            # Remove this row from lsolve_row_range as it will be treated specially.
-            lsolve_row_range = lsolve_row_range[2:end]
-        end
-        if lsolve_has_last_row
-            # Remove this row from lsolve_row_range as it will be treated specially.
-            lsolve_row_range = lsolve_row_range[1:end-1]
-        end
-        if rsolve_has_left_col
-            # Remove this col from lsolve_row_range as it will be treated specially.
-            rsolve_col_range = rsolve_col_range[1:end-1]
-        end
-        if rsolve_has_right_col
-            # Remove this col from lsolve_row_range as it will be treated specially.
-            rsolve_col_range = rsolve_col_range[2:end]
-        end
+        wrk_range, lsolve_row_range, lsolve_n_chunks, lsolve_col_ranges,
+            lsolve_has_first_row, lsolve_has_last_row, rsolve_col_range, rsolve_n_chunks,
+            rsolve_row_ranges, rsolve_is_chunk_edge, rsolve_has_right_col,
+            rsolve_has_left_col = get_chunking_parameters(m, n, L, U, comm_rank,
+                                                          comm_size)
 
         return new{Tf, Ti, typeof(lu_object)}(m, n, L, U, p, q, Rs, wrk, lu_object, comm,
                                               comm_rank, comm_size, comm_prev_proc,
@@ -499,6 +326,192 @@ mutable struct ParallelSparseLU{Tf, Ti,
                                               rsolve_has_right_col, rsolve_has_left_col,
                                               MPI_Win_store, MPI_Win_store_internal)
     end
+end
+
+function get_chunking_parameters(m::Ti, n::Ti, L, U, comm_rank, comm_size) where {Ti}
+    # Get a sub-range for this process to iterate over in `wrk` from a global index range.
+    # Define chunk_size so that comm_size*chunk_size ≥ m, with equality if comm_size
+    # divides m exactly.
+    chunk_size = (m + comm_size - 1) ÷ comm_size
+    imin = comm_rank * chunk_size + 1
+    imax = min((comm_rank + 1) * chunk_size + 1 - 1, m)
+    wrk_range = imin:imax
+
+    lsolve_row_range = 1+comm_rank:comm_size:m
+    if 1 ∈ lsolve_row_range
+        lsolve_has_first_row = true
+    else
+        lsolve_has_first_row = false
+    end
+    if n ∈ lsolve_row_range
+        lsolve_has_last_row = true
+    else
+        lsolve_has_last_row = false
+    end
+
+    rsolve_col_range = n-comm_rank:-comm_size:1
+    if 1 ∈ rsolve_col_range
+        rsolve_has_left_col = true
+    else
+        rsolve_has_left_col = false
+    end
+    if n ∈ rsolve_col_range
+        rsolve_has_right_col = true
+    else
+        rsolve_has_right_col = false
+    end
+
+    L_rowptr = L.rowptr
+    L_colval = L.colval
+
+    # Get row sizes, which we will use to estimate a sensible chunk size.
+    # Exclude the diagonal from the row sizes, as that is treated specially.
+    row_sizes = L_rowptr[2:end] .- L_rowptr[1:end-1] .- 1
+    mean_row_size = mean(row_sizes)
+    max_row_size = maximum(row_sizes)
+
+    # Guess a sensible chunk_size to balance communication and computation costs.
+    # Every row will be divided into `lsolve_n_chunks` chunks of size `chunk_size`. For
+    # many rows several chunks will probably be empty, but use the same `lsolve_n_chunks`
+    # and `chunk_size` for every row to guarantee that there are no race condition errors
+    # even though row sizes can vary.
+    if comm_size == 1
+        # Special case - only ever want one chunk as there is no parallelism.
+        chunk_size = n
+        lsolve_n_chunks = 1
+    else
+        chunk_size = max(round(Ti, mean_row_size) ÷ comm_size, 1)
+        lsolve_n_chunks = (max_row_size + chunk_size - 1) ÷ chunk_size
+    end
+
+    lsolve_col_ranges = Matrix{UnitRange{Int64}}(undef, lsolve_n_chunks, length(lsolve_row_range))
+
+    for (myrow_counter,row) ∈ enumerate(lsolve_row_range)
+        # Indices of sub-diagonal values in this row
+        jmin = L_rowptr[row]
+        # `L_rowptr[row+1]` is the first element of the next row. `L_rowptr[row+1]-1`
+        # would be the diagonal element of L, so the '-2' here is to skip that
+        # diagonal element.
+        jmax = L_rowptr[row+1]-2
+
+        thisrow_colvals = [L_colval[j] for j ∈ jmin:jmax]
+
+        for c ∈ 1:lsolve_n_chunks
+            # Chunks are created left-to-right
+            chunk_left = row - (lsolve_n_chunks - c + 1)*chunk_size
+            chunk_right = row - (lsolve_n_chunks - c)*chunk_size - 1
+
+            # If the value being searched for is less than all the values in the array,
+            # `searchsortedlast()` returns 0, and `searchsortedfirst()` returns 1, so that
+            # in that case we get an empty range.
+            j_left = jmin - 1 + searchsortedfirst(thisrow_colvals, chunk_left)
+            j_right = jmin - 1 + searchsortedlast(thisrow_colvals, chunk_right)
+
+            lsolve_col_ranges[c, myrow_counter] = j_left:j_right
+        end
+    end
+
+    U_colptr = U.colptr
+    U_rowval = U.rowval
+
+    # Get column sizes, which we will use to estimate a sensible chunk size.
+    # Exclude the diagonal from the column sizes, as that is treated specially.
+    col_sizes = U_colptr[2:end] .- U_colptr[1:end-1] .- 1
+    mean_col_size = round(Ti, mean(col_sizes))
+    max_col_size = maximum(col_sizes)
+
+    # Guess a sensible chunk_size to balance communication and computation costs.
+    # Every column will be divided into `rsolve_n_chunks` chunks of size `chunk_size`. For
+    # many columns several chunks will probably be empty, but use the same
+    # `rsolve_n_chunks` and `chunk_size` for every column to guarantee that there are no
+    # race condition errors even though column sizes can vary.
+    if comm_size == 1
+        # Special case - only ever want one chunk as there is no parallelism.
+        chunk_size = m
+    else
+        chunk_size = max(mean_col_size ÷ comm_size, 1)
+    end
+
+    # For rsolve!(), to avoid race conditions the chunks need to be aligned to fixed rows
+    # in the matrix.
+    # First find the maximum number of chunks needed for any column
+    rsolve_chunk_edges = 1:chunk_size:m
+    rsolve_n_chunks = 0
+    for col ∈ 1:n
+        # Indices of super-diagonal values in this column
+        this_minrow = U_rowval[U_colptr[col]]
+        # `U_colptr[col+1]` is the first element of the next column. `U_colptr[row+1]-1`
+        # would be the diagonal element of U, so the '-2' here is to skip that diagonal
+        # element.
+        this_maxrow = U_rowval[max(U_colptr[col+1]-2,1)]
+
+        chunk_minrow = searchsortedlast(rsolve_chunk_edges, this_minrow)
+        chunk_maxrow = searchsortedlast(rsolve_chunk_edges, this_maxrow)
+        rsolve_n_chunks = max(rsolve_n_chunks, chunk_maxrow - chunk_minrow + 1)
+    end
+
+    rsolve_row_ranges = Matrix{StepRange{Int64}}(undef, rsolve_n_chunks, length(rsolve_col_range))
+    rsolve_is_chunk_edge = Vector{Bool}(undef, length(rsolve_col_range))
+    for (mycol_counter,col) ∈ enumerate(rsolve_col_range)
+        # Indices of super-diagonal values in this column
+        jmin = U_colptr[col]
+        # `U_colptr[col+1]` is the first element of the next column. `U_colptr[row+1]-1`
+        # would be the diagonal element of U, so the '-2' here is to skip that diagonal
+        # element.
+        jmax = U_colptr[col+1]-2
+
+        thiscol_rowvals = [U_rowval[j] for j ∈ jmin:jmax]
+
+        # Chunk edges are given by rsolve_chunk_edges. Sort thiscol_rowvals into
+        # chunks.
+        rsolve_is_chunk_edge[mycol_counter] = (col ∈ rsolve_chunk_edges)
+        bottom_chunk = searchsortedlast(rsolve_chunk_edges, col - 1)
+        for c ∈ 1:rsolve_n_chunks
+            this_chunk = bottom_chunk - c + 1
+            if this_chunk ≥ 1
+                if this_chunk == length(rsolve_chunk_edges)
+                    chunk_bottom = m
+                else
+                    chunk_bottom = rsolve_chunk_edges[this_chunk+1] - 1
+                end
+                chunk_top = rsolve_chunk_edges[this_chunk]
+            else
+                # No points in this chunk
+                chunk_bottom = 0
+                chunk_top = 1
+            end
+
+            # If the value being searched for is less than all the values in the array,
+            # `searchsortedlast()` returns 0, and `searchsortedfirst()` returns 1, so that
+            # in that case we get an empty range.
+            j_bottom = jmin - 1 + searchsortedlast(thiscol_rowvals, chunk_bottom)
+            j_top = jmin - 1 + searchsortedfirst(thiscol_rowvals, chunk_top)
+
+            rsolve_row_ranges[c, mycol_counter] = j_bottom:-1:j_top
+        end
+    end
+
+    if lsolve_has_first_row
+        # Remove this row from lsolve_row_range as it will be treated specially.
+        lsolve_row_range = lsolve_row_range[2:end]
+    end
+    if lsolve_has_last_row
+        # Remove this row from lsolve_row_range as it will be treated specially.
+        lsolve_row_range = lsolve_row_range[1:end-1]
+    end
+    if rsolve_has_left_col
+        # Remove this col from lsolve_row_range as it will be treated specially.
+        rsolve_col_range = rsolve_col_range[1:end-1]
+    end
+    if rsolve_has_right_col
+        # Remove this col from lsolve_row_range as it will be treated specially.
+        rsolve_col_range = rsolve_col_range[2:end]
+    end
+
+    return wrk_range, lsolve_row_range, lsolve_n_chunks, lsolve_col_ranges,
+           lsolve_has_first_row, lsolve_has_last_row, rsolve_col_range, rsolve_n_chunks,
+           rsolve_row_ranges, rsolve_is_chunk_edge, rsolve_has_right_col,
+           rsolve_has_left_col
 end
 
 function cleanup_ParallelSparseLU!(F::ParallelSparseLU)
@@ -564,11 +577,11 @@ function lu!(F::ParallelSparseLU, A::Union{SparseMatrixCSC,Nothing})
         new_U = F.lu_object.U
 
         # If any arrays changed size then we need to reallocate the arrays
-        reallocate = Ref(size(F.L.colval) != size(new_L.colval)
-                         || size(F.L.rowptr) != size(new_L.rowptr)
+        reallocate = Ref(F.L.colval != new_L.colval
+                         || F.L.rowptr != new_L.rowptr
                          || size(F.L.nzval) != size(new_L.nzval)
-                         || size(F.U.rowval) != size(new_U.rowval)
-                         || size(F.U.colptr) != size(new_U.colptr)
+                         || F.U.rowval != new_U.rowval
+                         || F.U.colptr != new_U.colptr
                          || size(F.U.nzval) != size(new_U.nzval)
                         )
         MPI.Bcast!(reallocate, comm)
@@ -650,6 +663,13 @@ function lu!(F::ParallelSparseLU, A::Union{SparseMatrixCSC,Nothing})
             new_U_nzval = allocate_shared(F, this_length[]; external=false)
             F.U = SparseMatrixCSR{1}(F.m, F.n, new_U_rowptr, new_U_colval, new_U_nzval)
         end
+    end
+    if reallocate[]
+        F.wrk_range, F.lsolve_row_range, F.lsolve_n_chunks, F.lsolve_col_ranges,
+            F.lsolve_has_first_row, F.lsolve_has_last_row, F.rsolve_col_range,
+            F.rsolve_n_chunks, F.rsolve_row_ranges, F.rsolve_is_chunk_edge,
+            F.rsolve_has_right_col, F.rsolve_has_left_col =
+                get_chunking_parameters(F.m, F.n, F.L, F.U, F.comm_rank, F.comm_size)
     end
     MPI.Barrier(comm)
     return nothing
