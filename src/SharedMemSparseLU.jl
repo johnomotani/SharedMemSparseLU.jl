@@ -129,8 +129,8 @@ struct ParallelSparseLU{Tf, Ti}
     rsolve_col_range::StepRange{Int64}
     rsolve_n_chunks::Ti
     rsolve_row_ranges::Matrix{StepRange{Int64}}
-    rsolve_has_first_col::Bool
-    rsolve_has_last_col::Bool
+    rsolve_has_right_col::Bool
+    rsolve_has_left_col::Bool
     MPI_Win_store::MPI_Win_store_struct
 end
 
@@ -371,14 +371,14 @@ function sharedmem_lu(A::SparseMatrixCSC{Tf,Ti}, comm=MPI.COMM_WORLD) where {Tf,
 
     rsolve_col_range = n-comm_rank:-comm_size:1
     if 1 ∈ rsolve_col_range
-        rsolve_has_first_col = true
+        rsolve_has_left_col = true
     else
-        rsolve_has_first_col = false
+        rsolve_has_left_col = false
     end
-    if m ∈ rsolve_col_range
-        rsolve_has_last_col = true
+    if n ∈ rsolve_col_range
+        rsolve_has_right_col = true
     else
-        rsolve_has_last_col = false
+        rsolve_has_right_col = false
     end
 
     MPI.Barrier(comm)
@@ -509,7 +509,7 @@ function sharedmem_lu(A::SparseMatrixCSC{Tf,Ti}, comm=MPI.COMM_WORLD) where {Tf,
             j_bottom = jmin - 1 + searchsortedlast(thiscol_rowvals, chunk_bottom)
             j_top = jmin - 1 + searchsortedfirst(thiscol_rowvals, chunk_top)
 
-            rsolve_row_ranges[c, col] = j_bottom:-1:j_top
+            rsolve_row_ranges[c, mycol_counter] = j_bottom:-1:j_top
         end
     end
 
@@ -521,11 +521,11 @@ function sharedmem_lu(A::SparseMatrixCSC{Tf,Ti}, comm=MPI.COMM_WORLD) where {Tf,
         # Remove this row from lsolve_row_range as it will be treated specially.
         lsolve_row_range = lsolve_row_range[1:end-1]
     end
-    if rsolve_has_first_col
+    if rsolve_has_left_col
         # Remove this col from lsolve_row_range as it will be treated specially.
         rsolve_col_range = rsolve_col_range[2:end]
     end
-    if rsolve_has_last_col
+    if rsolve_has_right_col
         # Remove this col from lsolve_row_range as it will be treated specially.
         rsolve_col_range = rsolve_col_range[1:end-1]
     end
@@ -534,8 +534,8 @@ function sharedmem_lu(A::SparseMatrixCSC{Tf,Ti}, comm=MPI.COMM_WORLD) where {Tf,
                             comm_size, comm_prev_proc, comm_next_proc, wrk_range,
                             lsolve_row_range, lsolve_n_chunks, lsolve_col_ranges,
                             lsolve_has_first_row, lsolve_has_last_row, rsolve_col_range,
-                            rsolve_n_chunks, rsolve_row_ranges, rsolve_has_first_col,
-                            rsolve_has_last_col, MPI_Win_store)
+                            rsolve_n_chunks, rsolve_row_ranges, rsolve_has_right_col,
+                            rsolve_has_left_col, MPI_Win_store)
 end
 
 function sharedmem_lu!(F::ParallelSparseLU, A::SparseMatrixCSC)
@@ -655,6 +655,7 @@ function lsolve!(x, F::ParallelSparseLU{Tf,Ti}, b) where {Tf,Ti}
     col_ranges = F.lsolve_col_ranges
     comm_next_proc = F.comm_next_proc
     comm_prev_proc = F.comm_prev_proc
+
     if F.lsolve_has_first_row
         # Diagonal entry of L
         x[1] = b[1]
@@ -732,15 +733,15 @@ function rsolve!(x, F::ParallelSparseLU{Tf,Ti}, b) where {Tf,Ti}
     comm_next_proc = F.comm_next_proc
     comm_prev_proc = F.comm_prev_proc
 
-    if F.rsolve_has_first_col
+    if F.rsolve_has_right_col
         # Diagonal entry of L
-        x[1] = b[1] / nzval[colptr[2]-1]
+        x[end] = b[end] / nzval[end]
 
         this_row_ranges = @view row_ranges[:,1]
         for c ∈ 1:n_chunks
             for j ∈ this_row_ranges[c]
                 row = rowval[j]
-                b[row] -= nzval[j] * x[1]
+                b[row] -= nzval[j] * x[end]
             end
             # Signal to next process that it can start its corresponding chunk now.
             # Use MPI.Ibarrier() because this process does not need to wait for the next
@@ -781,14 +782,14 @@ function rsolve!(x, F::ParallelSparseLU{Tf,Ti}, b) where {Tf,Ti}
             MPI.Ibarrier(comm_next_proc)
         end
     end
-    if F.rsolve_has_last_col
+    if F.rsolve_has_left_col
         # Need to wait for previous process to finish its corresponding chunk before
         # starting to compute these chunks.
         req = MPI.Ibarrier(comm_prev_proc)
         MPI.Wait(req)
 
         # Diagonal entry of L
-        x[end] = b[end] / nzval[end]
+        x[1] = b[1] / nzval[1]
     end
 
     return nothing
