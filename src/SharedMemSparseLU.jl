@@ -174,7 +174,7 @@ struct ParallelSparseLU{Tf, Ti, TLU <: Union{SparseArrays.UMFPACK.UmfpackLU,Noth
     wrk_range::UnitRange{Int64}
     lsolve_row_range::StepRange{Int64}
     lsolve_n_chunks::Ti
-    lsolve_col_ranges::Matrix{StepRange{Int64}}
+    lsolve_col_ranges::Matrix{UnitRange{Int64}}
     lsolve_has_first_row::Bool
     lsolve_has_last_row::Bool
     rsolve_col_range::StepRange{Int64}
@@ -384,7 +384,7 @@ struct ParallelSparseLU{Tf, Ti, TLU <: Union{SparseArrays.UMFPACK.UmfpackLU,Noth
             lsolve_n_chunks = (max_row_size + chunk_size - 1) ÷ chunk_size
         end
 
-        lsolve_col_ranges = Matrix{StepRange{Int64}}(undef, lsolve_n_chunks, length(lsolve_row_range))
+        lsolve_col_ranges = Matrix{UnitRange{Int64}}(undef, lsolve_n_chunks, length(lsolve_row_range))
 
         for (myrow_counter,row) ∈ enumerate(lsolve_row_range)
             # Indices of sub-diagonal values in this row
@@ -397,17 +397,17 @@ struct ParallelSparseLU{Tf, Ti, TLU <: Union{SparseArrays.UMFPACK.UmfpackLU,Noth
             thisrow_colvals = [L_colval[j] for j ∈ jmin:jmax]
 
             for c ∈ 1:lsolve_n_chunks
-                # Chunks are created right-to-left from the diagonal
-                chunk_right = row - (c-1)*chunk_size - 1
-                chunk_left = row - c*chunk_size
+                # Chunks are created left-to-right
+                chunk_left = row - (lsolve_n_chunks - c + 1)*chunk_size
+                chunk_right = row - (lsolve_n_chunks - c)*chunk_size - 1
 
                 # If the value being searched for is less than all the values in the array,
                 # `searchsortedlast()` returns 0, and `searchsortedfirst()` returns 1, so that
                 # in that case we get an empty range.
-                j_right = jmin - 1 + searchsortedlast(thisrow_colvals, chunk_right)
                 j_left = jmin - 1 + searchsortedfirst(thisrow_colvals, chunk_left)
+                j_right = jmin - 1 + searchsortedlast(thisrow_colvals, chunk_right)
 
-                lsolve_col_ranges[c, myrow_counter] = j_right:-1:j_left
+                lsolve_col_ranges[c, myrow_counter] = j_left:j_right
             end
         end
 
