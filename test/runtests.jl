@@ -36,8 +36,7 @@ function runtests()
     rng = MersenneTwister(42)
 
     @testset "SharedMemSparseLU" begin
-        @testset "lsolve!" begin
-            n = 42
+        @testset "lsolve! $n" for n ∈ 1:200
 
             if comm_rank == 0
                 # Make a lower-triangular matrix
@@ -66,7 +65,7 @@ function runtests()
             cleanup_ParallelSparseLU!(A_lu)
         end
 
-        @testset "rsolve!" begin
+        @testset "rsolve! $n" for n ∈ 1:200
             n = 42
 
             if comm_rank == 0
@@ -100,7 +99,7 @@ function runtests()
             cleanup_ParallelSparseLU!(A_lu)
         end
 
-        @testset "dense matrix" begin
+        @testset "dense matrix $n" for n ∈ 1:200
             n = 42
 
             if comm_rank == 0
@@ -171,7 +170,7 @@ function runtests()
             cleanup_ParallelSparseLU!(A_lu)
         end
 
-        @testset "sparse matrix" begin
+        @testset "sparse matrix $n" for n ∈ 1:200
             if comm_rank == 0
                 A = test_matrix(rng)
             else
