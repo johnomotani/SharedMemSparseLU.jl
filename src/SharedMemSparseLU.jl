@@ -199,7 +199,7 @@ mutable struct ParallelSparseLU{Tf, Ti,
                 comm_next_proc = MPI.Comm_split(comm, 0, comm_rank)
             else
                 # Other processes do not need to participate in this communicator split.
-                comm_prev_proc = MPI.Comm_split(comm, nothing, comm_rank)
+                MPI.Comm_split(comm, nothing, comm_rank)
             end
         end
 
