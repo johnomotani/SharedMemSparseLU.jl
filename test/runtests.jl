@@ -92,7 +92,7 @@ function runtests()
                 rsolve!(x, A_lu, wrk)
 
                 if comm_rank == 0
-                    @test isapprox(x, A_lu.U \ b, rtol=tol, atol=tol)
+                    @test isapprox(x, A_lu.U \ b, rtol=dense_tol, atol=dense_tol)
                 end
                 cleanup_ParallelSparseLU!(A_lu)
             end
