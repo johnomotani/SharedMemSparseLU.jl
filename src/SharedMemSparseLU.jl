@@ -384,7 +384,7 @@ function get_chunking_parameters(m::Ti, n::Ti, L, U, comm_rank, comm_size) where
         lsolve_n_chunks = (max_row_size + chunk_size - 1) ÷ chunk_size
     end
 
-    lsolve_col_ranges = Matrix{UnitRange{Int64}}(undef, lsolve_n_chunks, length(lsolve_row_range))
+    lsolve_col_ranges = Matrix{UnitRange{Int64}}(undef, 2, length(lsolve_row_range))
 
     for (myrow_counter,row) ∈ enumerate(lsolve_row_range)
         # Indices of sub-diagonal values in this row
@@ -395,20 +395,11 @@ function get_chunking_parameters(m::Ti, n::Ti, L, U, comm_rank, comm_size) where
         jmax = L_rowptr[row+1]-2
 
         thisrow_colvals = [L_colval[j] for j ∈ jmin:jmax]
-
-        for c ∈ 1:lsolve_n_chunks
-            # Chunks are created left-to-right
-            chunk_left = row - (lsolve_n_chunks - c + 1)*chunk_size
-            chunk_right = row - (lsolve_n_chunks - c)*chunk_size - 1
-
-            # If the value being searched for is less than all the values in the array,
-            # `searchsortedlast()` returns 0, and `searchsortedfirst()` returns 1, so that
-            # in that case we get an empty range.
-            j_left = jmin - 1 + searchsortedfirst(thisrow_colvals, chunk_left)
-            j_right = jmin - 1 + searchsortedlast(thisrow_colvals, chunk_right)
-
-            lsolve_col_ranges[c, myrow_counter] = j_left:j_right
-        end
+        # This is the index of the first row that is (potentially) still being calculated
+        # by another process when this process tries to calculate x[row].
+        jsplit = jmin - 1 + searchsortedfirst(thisrow_colvals, row - comm_size + 1)
+        lsolve_col_ranges[1, myrow_counter] = jmin:jsplit-1
+        lsolve_col_ranges[2, myrow_counter] = jsplit:jmax
     end
 
     U_colptr = U.colptr
@@ -779,51 +770,56 @@ function lsolve!(x, F::ParallelSparseLU{Tf,Ti}, b) where {Tf,Ti}
         # Diagonal entry of L
         x[1] = b[1]
 
-        for c ∈ 1:n_chunks
-            # Signal to next process that it can start its corresponding chunk now.
-            # Use MPI.Ibarrier() because this process does not need to wait for the next
-            # process to reach this barrier.
-            MPI.Ibarrier(comm_next_proc)
-        end
+        # Signal to next process that it can finish its calculation now, using the values
+        # x[i≤row].
+        # Use MPI.Ibarrier() because this process does not need to wait for the next
+        # process to reach this barrier.
+        MPI.Ibarrier(comm_next_proc)
 
-        col_ranges_offset = 1
+        counter_offset = 1
     else
-        col_ranges_offset = 0
+        counter_offset = 0
     end
-    for (myrow_counter,row) ∈ enumerate(row_range)
+    for (offset_myrow_counter,row) ∈ enumerate(row_range)
+        myrow_counter = offset_myrow_counter + counter_offset
         # Diagonal entry of L
         x[row] = b[row]
 
-        this_col_ranges = @view col_ranges[:,myrow_counter+col_ranges_offset]
-        for c ∈ 1:n_chunks
-            # Need to wait for previous process to finish its corresponding chunk before
-            # starting to compute these chunks.
-            req = MPI.Ibarrier(comm_prev_proc)
-            MPI.Wait(req)
-            for j ∈ this_col_ranges[c]
-                col = colval[j]
-                x[row] -= x[col] * nzval[j]
-            end
-            # Signal to next process that it can start its corresponding chunk now.
-            # Use MPI.Ibarrier() because this process does not need to wait for the next
-            # process to reach this barrier.
-            MPI.Ibarrier(comm_next_proc)
+        this_col_ranges = @view col_ranges[:,myrow_counter]
+        for j ∈ this_col_ranges[1]
+            col = colval[j]
+            x[row] -= x[col] * nzval[j]
         end
+        # Need to wait for previous process to finish before
+        # starting to use these values.
+        req = MPI.Ibarrier(comm_prev_proc)
+        MPI.Wait(req)
+        for j ∈ this_col_ranges[2]
+            col = colval[j]
+            x[row] -= x[col] * nzval[j]
+        end
+        # Signal to next process that it can finish its calculation now, using the values
+        # x[i≤row].
+        # Use MPI.Ibarrier() because this process does not need to wait for the next
+        # process to reach this barrier.
+        MPI.Ibarrier(comm_next_proc)
     end
     if F.lsolve_has_last_row
         # Diagonal entry of L
         x[end] = b[end]
 
         this_col_ranges = @view col_ranges[:,end]
-        for c ∈ 1:n_chunks
-            # Need to wait for previous process to finish its corresponding chunk before
-            # starting to compute these chunks.
-            req = MPI.Ibarrier(comm_prev_proc)
-            MPI.Wait(req)
-            for j ∈ this_col_ranges[c]
-                col = colval[j]
-                x[end] -= x[col] * nzval[j]
-            end
+        for j ∈ this_col_ranges[1]
+            col = colval[j]
+            x[end] -= x[col] * nzval[j]
+        end
+        # Need to wait for previous process to finish before
+        # starting to use these values.
+        req = MPI.Ibarrier(comm_prev_proc)
+        MPI.Wait(req)
+        for j ∈ this_col_ranges[2]
+            col = colval[j]
+            x[end] -= x[col] * nzval[j]
         end
     end
 
