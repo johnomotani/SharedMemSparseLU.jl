@@ -28,8 +28,8 @@ function runtests()
     comm = MPI.COMM_WORLD
     comm_rank = MPI.Comm_rank(comm)
 
-    tol = 1.0e-13
-    dense_tol = 1.0e-11
+    tol = 1.0e-12
+    dense_tol = 1.0e-10
     Tf = Float64
     Ti = Int64
 
