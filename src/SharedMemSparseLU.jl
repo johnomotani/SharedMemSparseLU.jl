@@ -866,11 +866,12 @@ function rsolve!(x, F::ParallelSparseLU{Tf,Ti}, b) where {Tf,Ti}
             MPI.Ibarrier(comm_next_proc)
         end
 
-        row_ranges_offset = 1
+        counter_offset = 1
     else
-        row_ranges_offset = 0
+        counter_offset = 0
     end
-    for (mycol_counter,col) ∈ enumerate(col_range)
+    for (offset_mycol_counter,col) ∈ enumerate(col_range)
+        mycol_counter = offset_mycol_counter + counter_offset
         # Need to wait for previous process to finish its corresponding chunk before
         # starting to compute these chunks.
         req = MPI.Ibarrier(comm_prev_proc)
@@ -879,7 +880,7 @@ function rsolve!(x, F::ParallelSparseLU{Tf,Ti}, b) where {Tf,Ti}
         # Diagonal entry of L
         x[col] = b[col] / nzval[colptr[col+1]-1]
 
-        this_row_ranges = @view row_ranges[:,mycol_counter+row_ranges_offset]
+        this_row_ranges = @view row_ranges[:,mycol_counter]
         if is_chunk_edge[mycol_counter]
             for c ∈ 1:n_chunks-1
                 # Need to wait for previous process to finish its corresponding chunk before
