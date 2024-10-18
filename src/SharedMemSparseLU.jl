@@ -764,6 +764,8 @@ function lsolve!(x, F::ParallelSparseLU{Tf,Ti}, b) where {Tf,Ti}
     # Note that the diagonal elements of F.L are all 1. We can skip a few operations by
     # assuming this.
 
+    @boundscheck F.m > 1 && F.n > 1 || ArgumentError("lsolve!() should never be called for a 1x1 matrix")
+
     L = F.L
     colval = L.colval
     nzval = L.nzval
@@ -834,6 +836,8 @@ end
 Solve `U*x = b`, where `F.U` is the upper triangular factor of a matrix.
 """
 function rsolve!(x, F::ParallelSparseLU{Tf,Ti}, b) where {Tf,Ti}
+
+    @boundscheck F.m > 1 && F.n > 1 || ArgumentError("rsolve!() should never be called for a 1x1 matrix")
 
     U = F.U
     rowval = U.rowval
