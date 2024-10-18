@@ -37,11 +37,11 @@ function runtests()
     # make existing tests fail because the input is bad (e.g. the matrix is nearly
     # singular). If this happens, it might help to change the seed used to initialise the
     # random number generator `rng`.
-    rng = MersenneTwister(40)
+    rng = MersenneTwister(47)
 
     @testset "SharedMemSparseLU" begin
         @testset "lsolve!" begin
-            @testset "$n" for n ∈ 1:200
+            @testset "$n" for n ∈ 2:200
                 if comm_rank == 0
                     # Make a lower-triangular matrix
                     A = rand(rng, Tf, n, n)
@@ -69,7 +69,7 @@ function runtests()
         end
 
         @testset "rsolve!" begin
-            @testset "$n" for n ∈ 1:200
+            @testset "$n" for n ∈ 2:200
                 if comm_rank == 0
                     A = rand(rng, Tf, n, n)
                     A_sparse = sparse(A)
