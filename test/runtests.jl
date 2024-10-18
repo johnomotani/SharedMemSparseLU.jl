@@ -60,10 +60,12 @@ function runtests()
                 x = allocate_shared(A_lu, n)
 
                 lsolve!(x, A_lu, b)
+                MPI.Barrier(comm)
 
                 if comm_rank == 0
                     @test isapprox(x, A_lu.L \ b, rtol=tol, atol=tol)
                 end
+                MPI.Barrier(comm)
                 cleanup_ParallelSparseLU!(A_lu)
             end
         end
@@ -90,10 +92,12 @@ function runtests()
                 x = allocate_shared(A_lu, n)
 
                 rsolve!(x, A_lu, wrk)
+                MPI.Barrier(comm)
 
                 if comm_rank == 0
                     @test isapprox(x, A_lu.U \ b, rtol=dense_tol, atol=dense_tol)
                 end
+                MPI.Barrier(comm)
                 cleanup_ParallelSparseLU!(A_lu)
             end
         end
@@ -121,6 +125,7 @@ function runtests()
                 if comm_rank == 0
                     @test isapprox(x, A_sparse \ b, rtol=dense_tol, atol=dense_tol)
                 end
+                MPI.Barrier(comm)
 
                 # Check we can update the rhs
                 if comm_rank == 0
@@ -132,6 +137,7 @@ function runtests()
                 if comm_rank == 0
                     @test isapprox(x, A_sparse \ b, rtol=dense_tol, atol=dense_tol)
                 end
+                MPI.Barrier(comm)
 
                 # Check we can update the matrix
                 if comm_rank == 0
@@ -154,6 +160,7 @@ function runtests()
                 if comm_rank == 0
                     @test isapprox(x, A_sparse \ b, rtol=dense_tol, atol=dense_tol)
                 end
+                MPI.Barrier(comm)
 
                 # Check we can update the rhs again
                 if comm_rank == 0
@@ -165,6 +172,7 @@ function runtests()
                 if comm_rank == 0
                     @test isapprox(x, A_sparse \ b, rtol=dense_tol, atol=dense_tol)
                 end
+                MPI.Barrier(comm)
                 cleanup_ParallelSparseLU!(A_lu)
             end
         end
@@ -200,6 +208,7 @@ function runtests()
                 if comm_rank == 0
                     @test isapprox(x, A \ b, rtol=tol, atol=tol)
                 end
+                MPI.Barrier(comm)
 
                 # Check we can update the rhs
                 if comm_rank == 0
@@ -211,6 +220,7 @@ function runtests()
                 if comm_rank == 0
                     @test isapprox(x, A \ b, rtol=tol, atol=tol)
                 end
+                MPI.Barrier(comm)
 
                 # Check we can update the matrix
                 if comm_rank == 0
@@ -231,6 +241,7 @@ function runtests()
                 if comm_rank == 0
                     @test isapprox(x, A \ b, rtol=tol, atol=tol)
                 end
+                MPI.Barrier(comm)
 
                 # Check we can update the rhs again
                 if comm_rank == 0
@@ -242,6 +253,7 @@ function runtests()
                 if comm_rank == 0
                     @test isapprox(x, A \ b, rtol=tol, atol=tol)
                 end
+                MPI.Barrier(comm)
                 cleanup_ParallelSparseLU!(A_lu)
             end
         end
