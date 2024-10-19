@@ -123,6 +123,44 @@ function allocate_shared(comm::MPI.Comm, T, dims...)
     return array, win
 end
 
+function convert_to_CSR(M::SparseMatrixCSC)
+    rowval = M.rowval
+    colptr = M.colptr
+    nzval = M.nzval
+
+    colval_csr = similar(rowval)
+    rowptr_csr = similar(colptr)
+    nzval_csr = similar(nzval)
+
+    # Get numbers of entries in each row. Store the counts in rowptr_csr for now.
+    # Store the rows offset to `r+1` so that we can do an efficient cumulative sum
+    # afterwards.
+    rowptr_csr .= 0
+    for r ∈ rowval
+        rowptr_csr[r+1] += 1
+    end
+    # First row starts at index 1
+    rowptr_csr[1] = 1
+    for i ∈ 1:length(rowptr_csr)-1
+        rowptr_csr[i+1] = rowptr_csr[i] + rowptr_csr[i+1]
+    end
+
+    # Store each entry of the CSC matrix into the CSR matrix
+    row_offset = similar(rowptr_csr)
+    row_offset .= 0
+    for col ∈ 1:length(colptr)-1
+        for j ∈ colptr[col]:colptr[col+1]-1
+            row = rowval[j]
+            j_csr = rowptr_csr[row] + row_offset[row]
+            row_offset[row] += 1
+            colval_csr[j_csr] = col
+            nzval_csr[j_csr] = nzval[j]
+        end
+    end
+
+    return SparseMatrixCSR{1}(M.m, M.n, rowptr_csr, colval_csr, nzval_csr)
+end
+
 """
 Note that you must call `cleanup_ParallelSparseLU!(F)` when you are done with a
 `ParallelSparseLU` object `F` in order to free the MPI-shared-memory arrays associated
@@ -135,7 +173,7 @@ mutable struct ParallelSparseLU{Tf, Ti,
     m::Ti
     n::Ti
     L::SparseMatrixCSR{1,Tf,Ti}
-    U::SparseMatrixCSC{Tf,Ti}
+    U::SparseMatrixCSR{1,Tf,Ti}
     p::Vector{Ti}
     q::Vector{Ti}
     Rs::Vector{Tf}
@@ -149,16 +187,13 @@ mutable struct ParallelSparseLU{Tf, Ti,
     comm_next_proc::MPI.Comm
     wrk_range::UnitRange{Int64}
     lsolve_row_range::Tuple{Int64,Int64}
-    lsolve_n_chunks::Ti
     lsolve_col_ranges::Matrix{UnitRange{Int64}}
-    lsolve_has_first_row::Bool
-    lsolve_has_last_row::Bool
-    rsolve_col_range::Tuple{Int64,Int64}
-    rsolve_n_chunks::Ti
-    rsolve_row_ranges::Matrix{Tuple{Int64,Int64}}
-    rsolve_is_chunk_edge::Vector{Bool}
-    rsolve_has_right_col::Bool
-    rsolve_has_left_col::Bool
+    lsolve_has_top_row::Bool
+    lsolve_has_bottom_row::Bool
+    rsolve_row_range::Tuple{Int64,Int64}
+    rsolve_col_ranges::Matrix{UnitRange{Int64}}
+    rsolve_has_top_row::Bool
+    rsolve_has_bottom_row::Bool
     MPI_Win_store::Vector{MPI.Win}
     MPI_Win_store_internal::Vector{MPI.Win}
 
@@ -211,7 +246,9 @@ mutable struct ParallelSparseLU{Tf, Ti,
         if comm_rank == 0
             lu_object = lu(A)
             L_serial = get_L_matrix_CSR(lu_object)
-            U_serial = lu_object.U
+            # Convert U to CSR format, because this is nicer for shared-memory
+            # parallelism.
+            U_serial = convert_to_CSR(lu_object.U)
             m, n = size(A)
             this_length[] = m
             MPI.Bcast!(this_length, comm)
@@ -264,33 +301,33 @@ mutable struct ParallelSparseLU{Tf, Ti,
 
         this_length = Ref(0)
         if comm_rank == 0
-            this_length[] = length(U_serial.colptr)
+            this_length[] = length(U_serial.rowptr)
             MPI.Bcast!(this_length, comm)
         else
             MPI.Bcast!(this_length, comm)
         end
-        U_colptr, win = allocate_shared(comm, Ti, this_length[])
+        U_rowptr, win = allocate_shared(comm, Ti, this_length[])
         push!(MPI_Win_store_internal, win)
 
         if comm_rank == 0
-            this_length[] = length(U_serial.rowval)
+            this_length[] = length(U_serial.colval)
             MPI.Bcast!(this_length, comm)
         else
             MPI.Bcast!(this_length, comm)
         end
-        U_rowval, win = allocate_shared(comm, Ti, this_length[])
+        U_colval, win = allocate_shared(comm, Ti, this_length[])
         push!(MPI_Win_store_internal, win)
         U_nzval, win = allocate_shared(comm, Tf, this_length[])
         push!(MPI_Win_store_internal, win)
 
         if comm_rank == 0
-            U_colptr .= U_serial.colptr
-            U_rowval .= U_serial.rowval
+            U_rowptr .= U_serial.rowptr
+            U_colval .= U_serial.colval
             U_nzval .= U_serial.nzval
         end
         MPI.Barrier(comm)
 
-        U = SparseMatrixCSC(m, n, U_colptr, U_rowval, U_nzval)
+        U = SparseMatrixCSR{1}(m, n, U_rowptr, U_colval, U_nzval)
 
         # p, q, Rs, and wrk never change size, so store their windows in the non-internal
         # MPI_Win_store which is only emptied by cleanup_ParallelSparseLU!().
@@ -310,21 +347,19 @@ mutable struct ParallelSparseLU{Tf, Ti,
         wrk, win = allocate_shared(comm, Tf, m)
         push!(MPI_Win_store, win)
 
-        wrk_range, lsolve_row_range, lsolve_n_chunks, lsolve_col_ranges,
-            lsolve_has_first_row, lsolve_has_last_row, rsolve_col_range, rsolve_n_chunks,
-            rsolve_row_ranges, rsolve_is_chunk_edge, rsolve_has_right_col,
-            rsolve_has_left_col = get_chunking_parameters(m, n, L, U, comm_rank,
-                                                          comm_size)
+        wrk_range, lsolve_row_range, lsolve_col_ranges, lsolve_has_top_row,
+            lsolve_has_bottom_row, rsolve_row_range, rsolve_col_ranges,
+            rsolve_has_top_row, rsolve_has_bottom_row =
+            get_chunking_parameters(m, n, L, U, comm_rank, comm_size)
 
         return new{Tf, Ti, typeof(lu_object)}(m, n, L, U, p, q, Rs, wrk, lu_object, comm,
                                               comm_rank, comm_size, comm_prev_proc,
                                               comm_next_proc, wrk_range, lsolve_row_range,
-                                              lsolve_n_chunks, lsolve_col_ranges,
-                                              lsolve_has_first_row, lsolve_has_last_row,
-                                              rsolve_col_range, rsolve_n_chunks,
-                                              rsolve_row_ranges, rsolve_is_chunk_edge,
-                                              rsolve_has_right_col, rsolve_has_left_col,
-                                              MPI_Win_store, MPI_Win_store_internal)
+                                              lsolve_col_ranges, lsolve_has_top_row,
+                                              lsolve_has_bottom_row, rsolve_row_range,
+                                              rsolve_col_ranges, rsolve_has_top_row,
+                                              rsolve_has_bottom_row, MPI_Win_store,
+                                              MPI_Win_store_internal)
     end
 end
 
@@ -339,50 +374,30 @@ function get_chunking_parameters(m::Ti, n::Ti, L, U, comm_rank, comm_size) where
 
     lsolve_row_range = 1+comm_rank:comm_size:m
     if 1 ∈ lsolve_row_range
-        lsolve_has_first_row = true
+        lsolve_has_top_row = true
     else
-        lsolve_has_first_row = false
+        lsolve_has_top_row = false
     end
     if n ∈ lsolve_row_range
-        lsolve_has_last_row = true
+        lsolve_has_bottom_row = true
     else
-        lsolve_has_last_row = false
+        lsolve_has_bottom_row = false
     end
 
-    rsolve_col_range = n-comm_rank:-comm_size:1
-    if 1 ∈ rsolve_col_range
-        rsolve_has_left_col = true
+    rsolve_row_range = n-comm_rank:-comm_size:1
+    if 1 ∈ rsolve_row_range
+        rsolve_has_top_row = true
     else
-        rsolve_has_left_col = false
+        rsolve_has_top_row = false
     end
-    if n ∈ rsolve_col_range
-        rsolve_has_right_col = true
+    if m ∈ rsolve_row_range
+        rsolve_has_bottom_row = true
     else
-        rsolve_has_right_col = false
+        rsolve_has_bottom_row = false
     end
 
     L_rowptr = L.rowptr
     L_colval = L.colval
-
-    # Get row sizes, which we will use to estimate a sensible chunk size.
-    # Exclude the diagonal from the row sizes, as that is treated specially.
-    row_sizes = L_rowptr[2:end] .- L_rowptr[1:end-1] .- 1
-    mean_row_size = mean(row_sizes)
-    max_row_size = maximum(row_sizes)
-
-    # Guess a sensible chunk_size to balance communication and computation costs.
-    # Every row will be divided into `lsolve_n_chunks` chunks of size `chunk_size`. For
-    # many rows several chunks will probably be empty, but use the same `lsolve_n_chunks`
-    # and `chunk_size` for every row to guarantee that there are no race condition errors
-    # even though row sizes can vary.
-    if comm_size == 1
-        # Special case - only ever want one chunk as there is no parallelism.
-        chunk_size = n
-        lsolve_n_chunks = 1
-    else
-        chunk_size = max(round(Ti, mean_row_size) ÷ comm_size, 1)
-        lsolve_n_chunks = (max_row_size + chunk_size - 1) ÷ chunk_size
-    end
 
     lsolve_col_ranges = Matrix{UnitRange{Int64}}(undef, 2, length(lsolve_row_range))
 
@@ -392,7 +407,7 @@ function get_chunking_parameters(m::Ti, n::Ti, L, U, comm_rank, comm_size) where
         # `L_rowptr[row+1]` is the first element of the next row. `L_rowptr[row+1]-1`
         # would be the diagonal element of L, so the '-2' here is to skip that
         # diagonal element.
-        jmax = L_rowptr[row+1]-2
+        jmax = L_rowptr[row+1] - 2
 
         thisrow_colvals = [L_colval[j] for j ∈ jmin:jmax]
         # This is the index of the first row that is (potentially) still being calculated
@@ -402,105 +417,42 @@ function get_chunking_parameters(m::Ti, n::Ti, L, U, comm_rank, comm_size) where
         lsolve_col_ranges[2, myrow_counter] = jsplit:jmax
     end
 
-    U_colptr = U.colptr
-    U_rowval = U.rowval
+    U_rowptr = U.rowptr
+    U_colval = U.colval
 
-    # Get column sizes, which we will use to estimate a sensible chunk size.
-    # Exclude the diagonal from the column sizes, as that is treated specially.
-    col_sizes = U_colptr[2:end] .- U_colptr[1:end-1] .- 1
-    mean_col_size = round(Ti, mean(col_sizes))
-    max_col_size = maximum(col_sizes)
+    rsolve_col_ranges = Matrix{UnitRange{Int64}}(undef, 2, length(rsolve_row_range))
 
-    # Guess a sensible chunk_size to balance communication and computation costs.
-    # Every column will be divided into `rsolve_n_chunks` chunks of size `chunk_size`. For
-    # many columns several chunks will probably be empty, but use the same
-    # `rsolve_n_chunks` and `chunk_size` for every column to guarantee that there are no
-    # race condition errors even though column sizes can vary.
-    if comm_size == 1
-        # Special case - only ever want one chunk as there is no parallelism.
-        chunk_size = m
-    else
-        chunk_size = max(mean_col_size ÷ comm_size, 1)
+    for (myrow_counter,row) ∈ enumerate(rsolve_row_range)
+        # Indices of super-diagonal values in this row
+        # U_rowptr[row] is the first element of the row, which is the diagonal element.
+        jmin = U_rowptr[row] + 1
+        # `U_rowptr[row+1]` is the first element of the next row. `U_rowptr[row+1]-1`
+        # is the last element of this row.
+        jmax = U_rowptr[row+1] - 1
+
+        thisrow_colvals = [U_colval[j] for j ∈ jmin:jmax]
+        # This is the index of the last row that is (potentially) still being calculated
+        # by another process when this process tries to calculate b[row].
+        jsplit = jmin - 1 + searchsortedlast(thisrow_colvals, row + comm_size - 1)
+        rsolve_col_ranges[1, myrow_counter] = jsplit+1:jmax
+        rsolve_col_ranges[2, myrow_counter] = jmin:jsplit
     end
 
-    # For rsolve!(), to avoid race conditions the chunks need to be aligned to fixed rows
-    # in the matrix.
-    # First find the maximum number of chunks needed for any column
-    rsolve_chunk_edges = 1:chunk_size:m
-    rsolve_n_chunks = 0
-    for col ∈ 1:n
-        # Indices of super-diagonal values in this column
-        this_minrow = U_rowval[U_colptr[col]]
-        # `U_colptr[col+1]` is the first element of the next column. `U_colptr[row+1]-1`
-        # would be the diagonal element of U, so the '-2' here is to skip that diagonal
-        # element.
-        this_maxrow = U_rowval[max(U_colptr[col+1]-2,1)]
-
-        chunk_minrow = searchsortedlast(rsolve_chunk_edges, this_minrow)
-        chunk_maxrow = searchsortedlast(rsolve_chunk_edges, this_maxrow)
-        rsolve_n_chunks = max(rsolve_n_chunks, chunk_maxrow - chunk_minrow + 1)
-    end
-
-    rsolve_row_ranges = Matrix{Tuple{Int64,Int64}}(undef, rsolve_n_chunks, length(rsolve_col_range))
-    rsolve_is_chunk_edge = Vector{Bool}(undef, length(rsolve_col_range))
-    for (mycol_counter,col) ∈ enumerate(rsolve_col_range)
-        # Indices of super-diagonal values in this column
-        jmin = U_colptr[col]
-        # `U_colptr[col+1]` is the first element of the next column. `U_colptr[row+1]-1`
-        # would be the diagonal element of U, so the '-2' here is to skip that diagonal
-        # element.
-        jmax = U_colptr[col+1]-2
-
-        thiscol_rowvals = [U_rowval[j] for j ∈ jmin:jmax]
-
-        # Chunk edges are given by rsolve_chunk_edges. Sort thiscol_rowvals into
-        # chunks.
-        rsolve_is_chunk_edge[mycol_counter] = (col ∈ rsolve_chunk_edges)
-        bottom_chunk = searchsortedlast(rsolve_chunk_edges, col - 1)
-        for c ∈ 1:rsolve_n_chunks
-            this_chunk = bottom_chunk - c + 1
-            if this_chunk ≥ 1
-                if this_chunk == length(rsolve_chunk_edges)
-                    chunk_bottom = m
-                else
-                    chunk_bottom = rsolve_chunk_edges[this_chunk+1] - 1
-                end
-                chunk_top = rsolve_chunk_edges[this_chunk]
-            else
-                # No points in this chunk
-                chunk_bottom = 0
-                chunk_top = 1
-            end
-
-            # If the value being searched for is less than all the values in the array,
-            # `searchsortedlast()` returns 0, and `searchsortedfirst()` returns 1, so that
-            # in that case we get an empty range.
-            j_bottom = jmin - 1 + searchsortedlast(thiscol_rowvals, chunk_bottom)
-            j_top = jmin - 1 + searchsortedfirst(thiscol_rowvals, chunk_top)
-
-            steprange = j_bottom:-1:j_top
-            # Convert StepRanges (which here just iterate with a step of -1) to Tuples of
-            # (max_value+1,length) which we can use to construct simpler, more performant
-            # loop ranges.
-            rsolve_row_ranges[c, mycol_counter] = (first(steprange) + 1, length(steprange))
-        end
-    end
-
-    if lsolve_has_first_row
+    if lsolve_has_top_row
         # Remove this row from lsolve_row_range as it will be treated specially.
         lsolve_row_range = lsolve_row_range[2:end]
     end
-    if lsolve_has_last_row
+    if lsolve_has_bottom_row
         # Remove this row from lsolve_row_range as it will be treated specially.
         lsolve_row_range = lsolve_row_range[1:end-1]
     end
-    if rsolve_has_left_col
-        # Remove this col from lsolve_row_range as it will be treated specially.
-        rsolve_col_range = rsolve_col_range[1:end-1]
+    if rsolve_has_top_row
+        # Remove this row from rsolve_row_range as it will be treated specially.
+        rsolve_row_range = rsolve_row_range[1:end-1]
     end
-    if rsolve_has_right_col
-        # Remove this col from lsolve_row_range as it will be treated specially.
-        rsolve_col_range = rsolve_col_range[2:end]
+    if rsolve_has_bottom_row
+        # Remove this row from rsolve_row_range as it will be treated specially.
+        rsolve_row_range = rsolve_row_range[2:end]
     end
 
     # Convert StepRange to Tuple of (first_value,length) which we can use to construct a
@@ -508,12 +460,11 @@ function get_chunking_parameters(m::Ti, n::Ti, L, U, comm_rank, comm_size) where
     lsolve_row_range = (first(lsolve_row_range), length(lsolve_row_range))
     # Convert StepRange to Tuple of (max_value,length) which we can use to construct a
     # simpler, more performant loop range.
-    rsolve_col_range = (first(rsolve_col_range), length(rsolve_col_range))
+    rsolve_row_range = (first(rsolve_row_range), length(rsolve_row_range))
 
-    return wrk_range, lsolve_row_range, lsolve_n_chunks, lsolve_col_ranges,
-           lsolve_has_first_row, lsolve_has_last_row, rsolve_col_range, rsolve_n_chunks,
-           rsolve_row_ranges, rsolve_is_chunk_edge, rsolve_has_right_col,
-           rsolve_has_left_col
+    return wrk_range, lsolve_row_range, lsolve_col_ranges, lsolve_has_top_row,
+           lsolve_has_bottom_row, rsolve_row_range, rsolve_col_ranges, rsolve_has_top_row,
+           rsolve_has_bottom_row
 end
 
 function cleanup_ParallelSparseLU!(F::ParallelSparseLU)
@@ -576,14 +527,14 @@ function lu!(F::ParallelSparseLU, A::Union{SparseMatrixCSC,Nothing})
     if F.comm_rank == 0
         lu!(F.lu_object, A)
         new_L = get_L_matrix_CSR(F.lu_object)
-        new_U = F.lu_object.U
+        new_U = convert_to_CSR(F.lu_object.U)
 
         # If any arrays changed size then we need to reallocate the arrays
         reallocate = Ref(F.L.colval != new_L.colval
                          || F.L.rowptr != new_L.rowptr
                          || size(F.L.nzval) != size(new_L.nzval)
-                         || F.U.rowval != new_U.rowval
-                         || F.U.colptr != new_U.colptr
+                         || F.U.colval != new_U.colval
+                         || F.U.rowptr != new_U.rowptr
                          || size(F.U.nzval) != size(new_U.nzval)
                         )
         MPI.Bcast!(reallocate, comm)
@@ -611,27 +562,27 @@ function lu!(F::ParallelSparseLU, A::Union{SparseMatrixCSC,Nothing})
             MPI.Barrier(comm)
             F.L = SparseMatrixCSR{1}(F.m, F.n, new_L_rowptr, new_L_colval, new_L_nzval)
 
-            this_length = Ref(length(new_U.rowval))
+            this_length = Ref(length(new_U.colval))
             MPI.Bcast!(this_length, comm)
-            new_U_rowval = allocate_shared(F, this_length[]; int=true, external=false)
-            this_length = Ref(length(new_U.colptr))
+            new_U_colval = allocate_shared(F, this_length[]; int=true, external=false)
+            this_length = Ref(length(new_U.rowptr))
             MPI.Bcast!(this_length, comm)
-            new_U_colptr = allocate_shared(F, this_length[]; int=true, external=false)
+            new_U_rowptr = allocate_shared(F, this_length[]; int=true, external=false)
             this_length = Ref(length(new_U.nzval))
             MPI.Bcast!(this_length, comm)
             new_U_nzval = allocate_shared(F, this_length[]; external=false)
-            new_U_rowval .= new_U.rowval
-            new_U_colptr .= new_U.colptr
+            new_U_colval .= new_U.colval
+            new_U_rowptr .= new_U.rowptr
             new_U_nzval .= new_U.nzval
             MPI.Barrier(comm)
-            F.U = SparseMatrixCSR{1}(F.m, F.n, new_U_colptr, new_U_rowval, new_U_nzval)
+            F.U = SparseMatrixCSR{1}(F.m, F.n, new_U_rowptr, new_U_colval, new_U_nzval)
         else
             F.L.colval .= new_L.colval
             F.L.rowptr .= new_L.rowptr
             F.L.nzval .= new_L.nzval
 
-            F.U.rowval .= new_U.rowval
-            F.U.colptr .= new_U.colptr
+            F.U.colval .= new_U.colval
+            F.U.rowptr .= new_U.rowptr
             F.U.nzval .= new_U.nzval
         end
 
@@ -659,9 +610,9 @@ function lu!(F::ParallelSparseLU, A::Union{SparseMatrixCSC,Nothing})
             F.L = SparseMatrixCSR{1}(F.m, F.n, new_L_rowptr, new_L_colval, new_L_nzval)
 
             MPI.Bcast!(this_length, comm)
-            new_U_rowval = allocate_shared(F, this_length[]; int=true, external=false)
+            new_U_colval = allocate_shared(F, this_length[]; int=true, external=false)
             MPI.Bcast!(this_length, comm)
-            new_U_colptr = allocate_shared(F, this_length[]; int=true, external=false)
+            new_U_rowptr = allocate_shared(F, this_length[]; int=true, external=false)
             MPI.Bcast!(this_length, comm)
             new_U_nzval = allocate_shared(F, this_length[]; external=false)
             MPI.Barrier(comm)
@@ -669,10 +620,9 @@ function lu!(F::ParallelSparseLU, A::Union{SparseMatrixCSC,Nothing})
         end
     end
     if reallocate[]
-        F.wrk_range, F.lsolve_row_range, F.lsolve_n_chunks, F.lsolve_col_ranges,
-            F.lsolve_has_first_row, F.lsolve_has_last_row, F.rsolve_col_range,
-            F.rsolve_n_chunks, F.rsolve_row_ranges, F.rsolve_is_chunk_edge,
-            F.rsolve_has_right_col, F.rsolve_has_left_col =
+        F.wrk_range, F.lsolve_row_range, F.lsolve_col_ranges, F.lsolve_has_top_row,
+            F.lsolve_has_bottom_row, F.rsolve_row_range, F.rsolve_col_ranges,
+            F.rsolve_has_top_row, F.rsolve_has_bottom_row =
                 get_chunking_parameters(F.m, F.n, F.L, F.U, F.comm_rank, F.comm_size)
     end
     MPI.Barrier(comm)
@@ -774,18 +724,16 @@ function lsolve!(x, F::ParallelSparseLU{Tf,Ti}, b) where {Tf,Ti}
     colval = L.colval
     nzval = L.nzval
     row_range = F.lsolve_row_range
-    n_chunks = F.lsolve_n_chunks
     col_ranges = F.lsolve_col_ranges
     comm_size = F.comm_size
     comm_next_proc = F.comm_next_proc
     comm_prev_proc = F.comm_prev_proc
 
-    if F.lsolve_has_first_row
+    if F.lsolve_has_top_row
         # Diagonal entry of L
         x[1] = b[1]
 
-        # Signal to next process that it can finish its calculation now, using the values
-        # x[i≤row].
+        # Signal to next process that it can finish its calculation now, using x[1].
         # Use MPI.Ibarrier() because this process does not need to wait for the next
         # process to reach this barrier.
         MPI.Ibarrier(comm_next_proc)
@@ -815,13 +763,12 @@ function lsolve!(x, F::ParallelSparseLU{Tf,Ti}, b) where {Tf,Ti}
             col = colval[j]
             x[row] -= x[col] * nzval[j]
         end
-        # Signal to next process that it can finish its calculation now, using the values
-        # x[i≤row].
+        # Signal to next process that it can finish its calculation now, using x[row].
         # Use MPI.Ibarrier() because this process does not need to wait for the next
         # process to reach this barrier.
         MPI.Ibarrier(comm_next_proc)
     end
-    if F.lsolve_has_last_row
+    if F.lsolve_has_bottom_row
         # Diagonal entry of L
         x[end] = b[end]
 
@@ -847,129 +794,82 @@ end
     rsolve!(x, F, b)
 
 Solve `U*x = b`, where `F.U` is the upper triangular factor of a matrix.
+
+Uses `U` in compressed-sparse-row (CSR) format, so that we can loop over rows and for each
+row write to only `b[row]` and `x[row]`. This is unlike UMFPACK, so we have had to convert
+`U` from compressed-sparse-column (CSC) to CSR. This makes shared-memory parallelism
+easier and more efficient, as concurrent reads are OK, so we only have to make sure to
+avoid concurrent writes to `b` and `x` (or reads that might overlap with writes).
 """
 function rsolve!(x, F::ParallelSparseLU{Tf,Ti}, b) where {Tf,Ti}
 
     @boundscheck F.m > 1 && F.n > 1 || ArgumentError("rsolve!() should never be called for a 1x1 matrix")
 
     U = F.U
-    rowval = U.rowval
-    colptr = U.colptr
+    colval = U.colval
+    rowptr = U.rowptr
     nzval = U.nzval
-    col_range = F.rsolve_col_range
-    n_chunks = F.rsolve_n_chunks
-    row_ranges = F.rsolve_row_ranges
-    is_chunk_edge = F.rsolve_is_chunk_edge
+    row_range = F.rsolve_row_range
+    col_ranges = F.rsolve_col_ranges
     comm_size = F.comm_size
     comm_next_proc = F.comm_next_proc
     comm_prev_proc = F.comm_prev_proc
 
-    if F.rsolve_has_right_col
-        # Diagonal entry of L
+    if F.rsolve_has_bottom_row
+        # Diagonal entry of U
         x[end] = b[end] / nzval[end]
 
-        this_row_ranges = @view row_ranges[:,1]
-        for c ∈ 1:n_chunks
-            jmax_plus_one, j_length = this_row_ranges[c]
-            for k ∈ 1:j_length
-                j = jmax_plus_one - k
-                row = rowval[j]
-                b[row] -= nzval[j] * x[end]
-            end
-            # Signal to next process that it can start its corresponding chunk now.
-            # Use MPI.Ibarrier() because this process does not need to wait for the next
-            # process to reach this barrier.
-            MPI.Ibarrier(comm_next_proc)
-        end
+        # Signal to next process that it can finish its calculation now, using x[end].
+        MPI.Ibarrier(comm_next_proc)
 
         counter_offset = 1
     else
         counter_offset = 0
     end
-    col_range_max, col_range_length = col_range
-    for offset_mycol_counter ∈ 1:col_range_length
-        col = col_range_max - (offset_mycol_counter - 1) * comm_size
+    row_range_max, row_range_length = row_range
+    for offset_myrow_counter ∈ 1:row_range_length
+        row = row_range_max - (offset_myrow_counter - 1) * comm_size
 
-        mycol_counter = offset_mycol_counter + counter_offset
-        # Need to wait for previous process to finish its corresponding chunk before
-        # starting to compute these chunks.
+        myrow_counter = offset_myrow_counter + counter_offset
+
+        this_col_ranges = @view col_ranges[:,myrow_counter]
+        for j ∈ this_col_ranges[1]
+            col = colval[j]
+            b[row] -= nzval[j] * x[col]
+        end
+        # Need to wait for previous process to finish before
+        # starting to use these values.
         req = MPI.Ibarrier(comm_prev_proc)
         MPI.Wait(req)
-
-        # Diagonal entry of L
-        x[col] = b[col] / nzval[colptr[col+1]-1]
-
-        this_row_ranges = @view row_ranges[:,mycol_counter]
-        if is_chunk_edge[mycol_counter]
-            for c ∈ 1:n_chunks-1
-                # Need to wait for previous process to finish its corresponding chunk before
-                # starting to compute these chunks.
-                req = MPI.Ibarrier(comm_prev_proc)
-                MPI.Wait(req)
-                jmax_plus_one, j_length = this_row_ranges[c]
-                for k ∈ 1:j_length
-                    j = jmax_plus_one - k
-                    row = rowval[j]
-                    b[row] -= nzval[j] * x[col]
-                end
-                # Signal to next process that it can start its corresponding chunk now.
-                # Use MPI.Ibarrier() because this process does not need to wait for the next
-                # process to reach this barrier.
-                MPI.Ibarrier(comm_next_proc)
-            end
-            jmax_plus_one, j_length = this_row_ranges[end]
-            for k ∈ 1:j_length
-                j = jmax_plus_one - k
-                row = rowval[j]
-                b[row] -= nzval[j] * x[col]
-            end
-            # Signal to next process that it can start its corresponding chunk now.
-            # Use MPI.Ibarrier() because this process does not need to wait for the next
-            # process to reach this barrier.
-            MPI.Ibarrier(comm_next_proc)
-        else
-            jmax_plus_one, j_length = this_row_ranges[1]
-            for k ∈ 1:j_length
-                j = jmax_plus_one - k
-                row = rowval[j]
-                b[row] -= nzval[j] * x[col]
-            end
-            # Signal to next process that it can start its corresponding chunk now.
-            # Use MPI.Ibarrier() because this process does not need to wait for the next
-            # process to reach this barrier.
-            MPI.Ibarrier(comm_next_proc)
-            for c ∈ 2:n_chunks
-                # Need to wait for previous process to finish its corresponding chunk before
-                # starting to compute these chunks.
-                req = MPI.Ibarrier(comm_prev_proc)
-                MPI.Wait(req)
-                jmax_plus_one, j_length = this_row_ranges[c]
-                for k ∈ 1:j_length
-                    j = jmax_plus_one - k
-                    row = rowval[j]
-                    b[row] -= nzval[j] * x[col]
-                end
-                # Signal to next process that it can start its corresponding chunk now.
-                # Use MPI.Ibarrier() because this process does not need to wait for the next
-                # process to reach this barrier.
-                MPI.Ibarrier(comm_next_proc)
-            end
+        for j ∈ this_col_ranges[2]
+            col = colval[j]
+            b[row] -= nzval[j] * x[col]
         end
+
+        # Diagonal entry of U
+        x[row] = b[row] / nzval[rowptr[row]]
+        # Signal to next process that it can finish its calculation now, using x[row].
+        # Use MPI.Ibarrier() because this process does not need to wait for the next
+        # process to reach this barrier.
+        MPI.Ibarrier(comm_next_proc)
     end
-    if F.rsolve_has_left_col
-        # Need to wait for previous process to finish its corresponding chunk before
-        # starting to compute these chunks.
+    if F.rsolve_has_top_row
+        this_col_ranges = @view col_ranges[:,end]
+        for j ∈ this_col_ranges[1]
+            col = colval[j]
+            b[1] -= nzval[j] * x[col]
+        end
+        # Need to wait for previous process to finish before
+        # starting to use these values.
         req = MPI.Ibarrier(comm_prev_proc)
         MPI.Wait(req)
-
-        # Diagonal entry of L
-        x[1] = b[1] / nzval[1]
-        for c ∈ 2:n_chunks
-            # Need to make MPI.Ibarrier() calls to match the ones done by the 'previous'
-            # processor. Otherwise we would wait at the wrong times when we came to the
-            # next call to `ldiv!()`.
-            MPI.Ibarrier(comm_prev_proc)
+        for j ∈ this_col_ranges[2]
+            col = colval[j]
+            b[1] -= nzval[j] * x[col]
         end
+
+        # Diagonal entry of U
+        x[1] = b[1] / nzval[1]
     end
 
     return nothing
