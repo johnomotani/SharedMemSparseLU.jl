@@ -669,7 +669,10 @@ function lsolve!(x, F::ParallelSparseLU{Tf,Ti,TLU}, b) where {Tf,Ti,TLU}
         end
 
         x_row[] = temp
-        MPI.Reduce!(x_row, +, comm; root=comm_size-1)
+        # Use Allreduce!() even though we only need the result on
+        # `comm_rank == comm_size - 1` so that this call also synchronizes all processes -
+        # guessing this is more efficient than MPI.Reduce() followed by MPI.Barrier().
+        MPI.Allreduce!(x_row, +, comm)
 
         if comm_rank == comm_size - 1
             # Handle diagonal element of L (which is always 1) using the last rank.
