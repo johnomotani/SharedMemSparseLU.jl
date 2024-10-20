@@ -501,7 +501,7 @@ function lu!(F::ParallelSparseLU, A::Union{SparseMatrixCSC,Nothing})
             new_U_colptr .= new_U.colptr
             new_U_nzval .= new_U.nzval
             MPI.Barrier(comm)
-            F.U = SparseMatrixCSR{1}(F.m, F.n, new_U_colptr, new_U_rowval, new_U_nzval)
+            F.U = SparseMatrixCSC(F.m, F.n, new_U_colptr, new_U_rowval, new_U_nzval)
         else
             F.L.colval .= new_L.colval
             F.L.rowptr .= new_L.rowptr
@@ -542,7 +542,7 @@ function lu!(F::ParallelSparseLU, A::Union{SparseMatrixCSC,Nothing})
             MPI.Bcast!(this_length, comm)
             new_U_nzval = allocate_shared(F, this_length[]; external=false)
             MPI.Barrier(comm)
-            F.U = SparseMatrixCSR{1}(F.m, F.n, new_U_rowptr, new_U_colval, new_U_nzval)
+            F.U = SparseMatrixCSC(F.m, F.n, new_U_colptr, new_U_rowval, new_U_nzval)
         end
     end
     if reallocate[]
@@ -655,7 +655,7 @@ function lsolve!(x, F::ParallelSparseLU{Tf,Ti,TLU}, b) where {Tf,Ti,TLU}
     x_row = Ref(zero(Tf))
     for row ∈ 1:m
         # Diagonal entry of L
-        if comm_rank == comm_size -1
+        if comm_rank == comm_size - 1
             # Handle diagonal element of L (which is always 1) using the last rank.
             x[row] = b[row]
             temp = b[row]
