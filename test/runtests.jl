@@ -32,6 +32,7 @@ function runtests()
     dense_tol = 1.0e-10
     Tf = Float64
     Ti = Int64
+    nmax = 200
 
     # WARNING: as we use random numbers to generate test data, adding new tests, etc. may
     # make existing tests fail because the input is bad (e.g. the matrix is nearly
@@ -40,8 +41,8 @@ function runtests()
     rng = MersenneTwister(47)
 
     @testset "SharedMemSparseLU" begin
-        @testset "lsolve!" begin
-            @testset "$n" for n ∈ 2:200
+        @testset "lsolve! dense" begin
+            @testset "$n" for n ∈ 2:nmax
                 if comm_rank == 0
                     # Make a lower-triangular matrix
                     A = rand(rng, Tf, n, n)
@@ -70,8 +71,44 @@ function runtests()
             end
         end
 
-        @testset "rsolve!" begin
-            @testset "$n" for n ∈ 2:200
+        @testset "lsolve! sparse" begin
+            @testset "$n" for n ∈ 2:nmax
+                if comm_rank == 0
+                    A = test_matrix(rng)
+                else
+                    A = nothing
+                end
+                A_lu = ParallelSparseLU{Float64,Int64}(A)
+
+                this_length = Ref(0)
+                if comm_rank == 0
+                    this_length[] = size(A, 1)
+                    MPI.Bcast!(this_length, comm)
+                else
+                    MPI.Bcast!(this_length, comm)
+                end
+                n = this_length[]
+
+                # Create rhs
+                b = allocate_shared(A_lu, n)
+                if comm_rank == 0
+                    b .= rand(rng, Tf, n)
+                end
+                x = allocate_shared(A_lu, n)
+
+                lsolve!(x, A_lu, b)
+                MPI.Barrier(comm)
+
+                if comm_rank == 0
+                    @test isapprox(x, A_lu.L \ b, rtol=tol, atol=tol)
+                end
+                MPI.Barrier(comm)
+                cleanup_ParallelSparseLU!(A_lu)
+            end
+        end
+
+        @testset "rsolve! dense" begin
+            @testset "$n" for n ∈ 2:nmax
                 if comm_rank == 0
                     A = rand(rng, Tf, n, n)
                     A_sparse = sparse(A)
@@ -102,8 +139,47 @@ function runtests()
             end
         end
 
+        @testset "rsolve! sparse" begin
+            @testset "$n" for n ∈ 2:nmax
+                if comm_rank == 0
+                    A = test_matrix(rng)
+                else
+                    A = nothing
+                end
+                A_lu = ParallelSparseLU{Float64,Int64}(A)
+
+                this_length = Ref(0)
+                if comm_rank == 0
+                    this_length[] = size(A, 1)
+                    MPI.Bcast!(this_length, comm)
+                else
+                    MPI.Bcast!(this_length, comm)
+                end
+                n = this_length[]
+
+                # Create rhs
+                b = allocate_shared(A_lu, n)
+                wrk = allocate_shared(A_lu, n)
+                if comm_rank == 0
+                    b .= rand(rng, Tf, n)
+                    # rsolve!() will modify its third argument, so work with a copy
+                    wrk .= b
+                end
+                x = allocate_shared(A_lu, n)
+
+                rsolve!(x, A_lu, wrk)
+                MPI.Barrier(comm)
+
+                if comm_rank == 0
+                    @test isapprox(x, A_lu.U \ b, rtol=dense_tol, atol=dense_tol)
+                end
+                MPI.Barrier(comm)
+                cleanup_ParallelSparseLU!(A_lu)
+            end
+        end
+
         @testset "dense matrix " begin
-            @testset "$n" for n ∈ 1:200
+            @testset "$n" for n ∈ 1:nmax
                 if comm_rank == 0
                     A = rand(rng, Tf, n, n)
                     A_sparse = sparse(A)
@@ -178,7 +254,7 @@ function runtests()
         end
 
         @testset "sparse matrix" begin
-            @testset "$n" for n ∈ 1:200
+            @testset "$n" for n ∈ 1:nmax
                 if comm_rank == 0
                     A = test_matrix(rng)
                 else
