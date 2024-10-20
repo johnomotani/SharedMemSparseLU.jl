@@ -94,6 +94,86 @@ function get_L_matrix_CSR(F::UmfpackLU{Tf,Ti}) where {Tf,Ti}
     return SparseMatrixCSR{1}(n_row, n_col, increment!(Lp), increment!(Lj), Lx)
 end
 
+"""
+    fill_in_columns!(M::SparseMatrixCSC)
+
+Add non-structural zeros so that each column in `M` contains consecutive rows.
+"""
+function fill_in_columns!(M::SparseMatrixCSC{Tf,Ti}) where {Tf,Ti}
+    for col ∈ 1:M.n
+        colptr = M.colptr
+        jmin = colptr[col]
+        jmax = colptr[col+1] - 1
+        rowval = M.rowval
+        if rowval[jmax] - rowval[jmin] != jmax - jmin
+            # There are some missing rows, because their matrix elements are zero.
+            initial_row_values = rowval[jmin:jmax]
+            for i ∈ 1:length(initial_row_values)
+                row = i
+                while true
+                    row += 1
+                    if initial_row_values[i+1] == row
+                        break
+                    end
+                    # Fill with NaN to mark a non-structural zero which we can replace
+                    # with zero later
+                    M[i,col] = NaN
+                end
+            end
+        end
+    end
+
+    # Replace the NaNs we just added with zeros.
+    nzval = M.nzval
+    for i ∈ eachindex(nzval)
+        if isnan(nzval[i])
+            nzval[i] = zero(Tf)
+        end
+    end
+
+    return nothing
+end
+
+"""
+    fill_in_rows!(M::SparseMatrixCSR)
+
+Add non-structural zeros so that each row in `M` contains consecutive columns.
+"""
+function fill_in_rows!(M::SparseMatrixCSR{1,Tf,Ti}) where {Tf,Ti}
+    for row ∈ 1:M.m
+        rowptr = M.rowptr
+        jmin = rowptr[row]
+        jmax = rowptr[row+1] - 1
+        colval = M.colval
+        if colval[jmax] - colval[jmin] != jmax - jmin
+            # There are some missing columns, because their matrix elements are zero.
+            initial_col_values = colval[jmin:jmax]
+            for i ∈ 1:length(initial_col_values)
+                col = i
+                while true
+                    col += 1
+                    if initial_col_values[i+1] == col
+                        break
+                    end
+                    # Fill with NaN to mark a non-structural zero which we can replace
+                    # with zero later
+                    M[row,i] = NaN
+                end
+            end
+        end
+    end
+
+    # Replace the NaNs we just added with zeros.
+    nzval = M.nzval
+    for i ∈ eachindex(nzval)
+        if isnan(nzval[i])
+            nzval[i] = zero(Tf)
+        end
+    end
+
+    return nothing
+end
+
 function allocate_shared(comm::MPI.Comm, T, dims...)
     comm_rank = MPI.Comm_rank(comm)
     n = prod(dims)
@@ -148,8 +228,10 @@ mutable struct ParallelSparseLU{Tf, Ti,
     comm_prev_proc::MPI.Comm
     comm_next_proc::MPI.Comm
     wrk_range::UnitRange{Int64}
+    L_row_sizes::Vector{Ti}
     lsolve_col_ranges::Vector{UnitRange{Int64}}
     lsolve_x_ref::Ref{Tf}
+    U_col_sizes::Vector{Ti}
     rsolve_row_ranges::Vector{UnitRange{Int64}}
     MPI_Win_store::Vector{MPI.Win}
     MPI_Win_store_internal::Vector{MPI.Win}
@@ -203,7 +285,9 @@ mutable struct ParallelSparseLU{Tf, Ti,
         if comm_rank == 0
             lu_object = lu(A)
             L_serial = get_L_matrix_CSR(lu_object)
+            fill_in_rows!(L_serial)
             U_serial = lu_object.U
+            fill_in_columns!(U_serial)
             m, n = size(A)
             this_length[] = m
             MPI.Bcast!(this_length, comm)
@@ -250,6 +334,7 @@ mutable struct ParallelSparseLU{Tf, Ti,
         MPI.Barrier(comm)
 
         L = SparseMatrixCSR{1}(m, n, L_rowptr, L_colval, L_nzval)
+        L_row_sizes = L.rowptr[2:end] .- L.rowptr[1:end-1]
 
         # Allocate and fill the U SparseMatrixCSC object
         ################################################
@@ -283,6 +368,7 @@ mutable struct ParallelSparseLU{Tf, Ti,
         MPI.Barrier(comm)
 
         U = SparseMatrixCSC(m, n, U_colptr, U_rowval, U_nzval)
+        U_col_sizes = U.colptr[2:end] .- U.colptr[1:end-1]
 
         # p, q, Rs, and wrk never change size, so store their windows in the non-internal
         # MPI_Win_store which is only emptied by cleanup_ParallelSparseLU!().
@@ -307,8 +393,9 @@ mutable struct ParallelSparseLU{Tf, Ti,
 
         return new{Tf, Ti, typeof(lu_object)}(m, n, L, U, p, q, Rs, wrk, lu_object, comm,
                                               comm_rank, comm_size, comm_prev_proc,
-                                              comm_next_proc, wrk_range,
-                                              lsolve_col_ranges, rsolve_row_ranges,
+                                              comm_next_proc, wrk_range, L_row_sizes,
+                                              lsolve_col_ranges, Ref(zero(Tf)),
+                                              U_col_sizes, rsolve_row_ranges,
                                               MPI_Win_store, MPI_Win_store_internal)
     end
 end
@@ -459,7 +546,9 @@ function lu!(F::ParallelSparseLU, A::Union{SparseMatrixCSC,Nothing})
     if F.comm_rank == 0
         lu!(F.lu_object, A)
         new_L = get_L_matrix_CSR(F.lu_object)
+        fill_in_rows!(new_L)
         new_U = F.lu_object.U
+        fill_in_columns!(new_U)
 
         # If any arrays changed size then we need to reallocate the arrays
         reallocate = Ref(F.L.colval != new_L.colval
@@ -554,6 +643,8 @@ function lu!(F::ParallelSparseLU, A::Union{SparseMatrixCSC,Nothing})
     if reallocate[]
         F.wrk_range, F.lsolve_col_ranges, F.rsolve_row_ranges =
             get_chunking_parameters(F.m, F.n, F.L, F.U, F.comm_rank, F.comm_size)
+        @. F.L_row_sizes = F.L.rowptr[2:end] - F.L.rowptr[1:end-1]
+        @. F.U_col_sizes = F.U.colptr[2:end] - F.U.colptr[1:end-1]
     end
     MPI.Barrier(comm)
     return nothing
@@ -649,8 +740,8 @@ function lsolve!(x, F::ParallelSparseLU{Tf,Ti,TLU}, b) where {Tf,Ti,TLU}
     # assuming this.
 
     L = F.L
-    colval = L.colval
     rowptr = L.rowptr
+    row_sizes = F.L_row_sizes
     nzval = L.nzval
     m = F.m
     col_ranges = F.lsolve_col_ranges
@@ -669,8 +760,10 @@ function lsolve!(x, F::ParallelSparseLU{Tf,Ti,TLU}, b) where {Tf,Ti,TLU}
             temp = zero(Tf)
         end
 
-        for j ∈ col_ranges[row]
-            col = colval[j]
+        this_col_range = col_ranges[row]
+        col_offset = -rowptr[row] + row - row_sizes[row] + 1
+        for j ∈ this_col_range
+            col = j + col_offset
             temp -= x[col] * nzval[j]
         end
 
@@ -697,8 +790,8 @@ Solve `U*x = b`, where `F.U` is the upper triangular factor of a matrix.
 function rsolve!(x, F::ParallelSparseLU, b)
 
     U = F.U
-    rowval = U.rowval
     colptr = U.colptr
+    col_sizes = F.U_col_sizes
     nzval = U.nzval
     n = F.n
     row_ranges = F.rsolve_row_ranges
@@ -714,8 +807,10 @@ function rsolve!(x, F::ParallelSparseLU, b)
 
         MPI.Barrier(comm)
 
+        this_row_range = row_ranges[col]
+        row_offset = -colptr[col] + col - col_sizes[col] + 1
         for j ∈ row_ranges[col]
-            row = rowval[j]
+            row = j + row_offset
             b[row] -= nzval[j] * x[col]
         end
     end
