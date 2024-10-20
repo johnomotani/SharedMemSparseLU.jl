@@ -148,8 +148,8 @@ mutable struct ParallelSparseLU{Tf, Ti,
     comm_prev_proc::MPI.Comm
     comm_next_proc::MPI.Comm
     wrk_range::UnitRange{Int64}
-    lsolve_col_ranges::Matrix{UnitRange{Int64}}
-    rsolve_row_ranges::Matrix{Tuple{Int64,Int64}}
+    lsolve_col_ranges::Vector{UnitRange{Int64}}
+    rsolve_row_ranges::Vector{UnitRange{Int64}}
     MPI_Win_store::Vector{MPI.Win}
     MPI_Win_store_internal::Vector{MPI.Win}
 
@@ -301,7 +301,7 @@ mutable struct ParallelSparseLU{Tf, Ti,
         wrk, win = allocate_shared(comm, Tf, m)
         push!(MPI_Win_store, win)
 
-        wrk_range, lsolve_col_ranges, rsolve_col_range =
+        wrk_range, lsolve_col_ranges, rsolve_row_ranges =
             get_chunking_parameters(m, n, L, U, comm_rank, comm_size)
 
         return new{Tf, Ti, typeof(lu_object)}(m, n, L, U, p, q, Rs, wrk, lu_object, comm,
@@ -328,12 +328,12 @@ function get_chunking_parameters(m::Ti, n::Ti, L, U, comm_rank, comm_size) where
     # by a different rank.
     lsolve_col_ranges = Vector{UnitRange{Int64}}(undef, m)
     for row ∈ 1:m
-        # Indices of sub-diagonal values in this row
+        # Indices of sub-diagonal values in this row.
         jmin = L_rowptr[row]
         # `L_rowptr[row+1]` is the first element of the next row. `L_rowptr[row+1]-1`
         # would be the diagonal element of L, so the '-2' here is to skip that
         # diagonal element.
-        jmax = L_rowptr[row+1]-2
+        jmax = L_rowptr[row+1] - 2
 
         row_size = jmax - jmin + 1
         chunk_size = (row_size + comm_size - 1) ÷ comm_size
@@ -344,10 +344,10 @@ function get_chunking_parameters(m::Ti, n::Ti, L, U, comm_rank, comm_size) where
         # is the rank that writes this value when handling the previous row.
         lastrank_jmin = jmin + (comm_size - 1) * chunk_size
         lastrank_jmax = min(jmax, jmin + comm_size * chunk_size - 1)
-        if lastrank_jmax < lastrank_jmin
+        if lastrank_jmax < lastrank_jmin && jmax ≥ jmin
             if comm_rank == comm_size - 1
                 thisrank_jmin = thisrank_jmax
-            elseif jmax == thisrank_jmax
+            elseif jmax == thisrank_jmax && thisrank_jmax ≥ thisrank_jmin
                 thisrank_jmax -= 1
             end
         end
@@ -362,13 +362,12 @@ function get_chunking_parameters(m::Ti, n::Ti, L, U, comm_rank, comm_size) where
     # processed by a different rank.
     rsolve_row_ranges = Vector{UnitRange{Int64}}(undef, n)
     for col ∈ 1:n
-        # Indices of super-diagonal values in this column
-        # `U_colptr[col]` is the diagonal element, so +1 to skip it to the first
-        # super-diagonal element.
-        jmin = U_colptr[col] + 1
-        # `U_colptr[row+1]` is the first element of the next column, so
-        # `U_colptr[row+1]-1` is the last element of this row.
-        jmax = U_colptr[col+1]-1
+        # Indices of super-diagonal values in this column.
+        jmin = U_colptr[col]
+        # `U_colptr[row+1]` is the first element of the next column, `U_colptr[row+1]-1`
+        # would be the diagonal element of U, so the '-2' here is to skip that
+        # diagonal element.
+        jmax = U_colptr[col+1] - 2
 
         col_size = jmax - jmin + 1
         chunk_size = (col_size + comm_size - 1) ÷ comm_size
@@ -380,15 +379,15 @@ function get_chunking_parameters(m::Ti, n::Ti, L, U, comm_rank, comm_size) where
         # is the rank that writes this value when handling the previous column.
         lastrank_jmin = jmin + (comm_size - 1) * chunk_size
         lastrank_jmax = min(jmax, jmin + comm_size * chunk_size - 1)
-        if lastrank_jmax < lastrank_jmin
+        if lastrank_jmax < lastrank_jmin && jmax ≥ jmin
             if comm_rank == comm_size - 1
                 thisrank_jmin = thisrank_jmax
-            elseif jmax == thisrank_jmax
+            elseif jmax == thisrank_jmax && thisrank_jmax ≥ thisrank_jmin
                 thisrank_jmax -= 1
             end
         end
 
-        rsolve_row_ranges[row] = thisrank_jmin:thisrank_jmax
+        rsolve_row_ranges[col] = thisrank_jmin:thisrank_jmax
     end
 
     return wrk_range, lsolve_col_ranges, rsolve_row_ranges
@@ -639,7 +638,7 @@ end
 
 Solve `L*x = b`, where `F.L` is the lower triangular factor of a matrix.
 """
-function lsolve!(x, F::ParallelSparseLU, b) where {Tf,Ti}
+function lsolve!(x, F::ParallelSparseLU{Tf,Ti,TLU}, b) where {Tf,Ti,TLU}
     # Note that the diagonal elements of F.L are all 1. We can skip a few operations by
     # assuming this.
 
@@ -653,7 +652,7 @@ function lsolve!(x, F::ParallelSparseLU, b) where {Tf,Ti}
     comm_rank = F.comm_rank
     comm_size = F.comm_size
 
-    x_row = Ref(0)
+    x_row = Ref(zero(Tf))
     for row ∈ 1:m
         # Diagonal entry of L
         if comm_rank == comm_size -1
@@ -670,9 +669,9 @@ function lsolve!(x, F::ParallelSparseLU, b) where {Tf,Ti}
         end
 
         x_row[] = temp
-        MPI.Reduce(x_row, +, comm; root=comm_size-1)
+        MPI.Reduce!(x_row, +, comm; root=comm_size-1)
 
-        if comm_rank == comm_size -1
+        if comm_rank == comm_size - 1
             # Handle diagonal element of L (which is always 1) using the last rank.
             x[row] = x_row[]
         end
@@ -686,7 +685,7 @@ end
 
 Solve `U*x = b`, where `F.U` is the upper triangular factor of a matrix.
 """
-function rsolve!(x, F::ParallelSparseLU, b) where {Tf,Ti}
+function rsolve!(x, F::ParallelSparseLU, b)
 
     U = F.U
     rowval = U.rowval
