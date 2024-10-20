@@ -402,6 +402,11 @@ function cleanup_ParallelSparseLU!(F::ParallelSparseLU)
         MPI.free(win)
     end
     empty!(F.MPI_Win_store)
+
+    # Call garbage collection explicitly to ensure the communicators that were created for
+    # this `ParallelSparseLU` are freed.
+    GC.gc(false)
+
     return nothing
 end
 
