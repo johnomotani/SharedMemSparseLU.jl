@@ -149,6 +149,7 @@ mutable struct ParallelSparseLU{Tf, Ti,
     comm_next_proc::MPI.Comm
     wrk_range::UnitRange{Int64}
     lsolve_col_ranges::Vector{UnitRange{Int64}}
+    lsolve_x_ref::Ref{Tf}
     rsolve_row_ranges::Vector{UnitRange{Int64}}
     MPI_Win_store::Vector{MPI.Win}
     MPI_Win_store_internal::Vector{MPI.Win}
@@ -653,11 +654,11 @@ function lsolve!(x, F::ParallelSparseLU{Tf,Ti,TLU}, b) where {Tf,Ti,TLU}
     nzval = L.nzval
     m = F.m
     col_ranges = F.lsolve_col_ranges
+    x_ref = F.lsolve_x_ref
     comm = F.comm
     comm_rank = F.comm_rank
     comm_size = F.comm_size
 
-    x_row = Ref(zero(Tf))
     for row ∈ 1:m
         # Diagonal entry of L
         if comm_rank == comm_size - 1
@@ -673,15 +674,15 @@ function lsolve!(x, F::ParallelSparseLU{Tf,Ti,TLU}, b) where {Tf,Ti,TLU}
             temp -= x[col] * nzval[j]
         end
 
-        x_row[] = temp
+        x_ref[] = temp
         # Use Allreduce!() even though we only need the result on
         # `comm_rank == comm_size - 1` so that this call also synchronizes all processes -
         # guessing this is more efficient than MPI.Reduce() followed by MPI.Barrier().
-        MPI.Allreduce!(x_row, +, comm)
+        MPI.Allreduce!(x_ref, +, comm)
 
         if comm_rank == comm_size - 1
             # Handle diagonal element of L (which is always 1) using the last rank.
-            x[row] = x_row[]
+            x[row] = x_ref[]
         end
     end
 
