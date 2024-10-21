@@ -105,15 +105,19 @@ function fill_in_columns!(M::SparseMatrixCSC{Tf,Ti}) where {Tf,Ti}
         jmin = colptr[col]
         jmax = colptr[col+1] - 1
         rowval = M.rowval
-        if rowval[jmax] - rowval[jmin] != jmax - jmin
+        rowsize = rowval[jmax] - rowval[jmin]
+        if rowsize > jmax - jmin
             # There are some missing rows, because their matrix elements are zero.
             initial_row_values = rowval[jmin:jmax]
-            for i ∈ 1:length(initial_row_values)
-                row = i
+            rowleft = first(initial_row_values) - 1
+            for i ∈ 1:length(initial_row_values)-1
+                row = rowleft + i
                 while true
                     row += 1
                     if initial_row_values[i+1] == row
                         break
+                    elseif row > rowleft + rowsize
+                        error("failed to find end of row")
                     end
                     # Fill with NaN to mark a non-structural zero which we can replace
                     # with zero later
@@ -140,34 +144,37 @@ end
 Add non-structural zeros so that each row in `M` contains consecutive columns.
 """
 function fill_in_rows!(M::SparseMatrixCSR{1,Tf,Ti}) where {Tf,Ti}
+    rowptr = M.rowptr
+    colval = M.colval
+    nzval = M.nzval
     for row ∈ 1:M.m
-        rowptr = M.rowptr
         jmin = rowptr[row]
         jmax = rowptr[row+1] - 1
-        colval = M.colval
-        if colval[jmax] - colval[jmin] != jmax - jmin
+        colsize = colval[jmax] - colval[jmin]
+        if colsize > jmax - jmin
             # There are some missing columns, because their matrix elements are zero.
             initial_col_values = colval[jmin:jmax]
-            for i ∈ 1:length(initial_col_values)
-                col = i
+            coltop = first(initial_col_values) - 1
+            for i ∈ 1:length(initial_col_values)-1
+                col = coltop + i
                 while true
                     col += 1
                     if initial_col_values[i+1] == col
                         break
+                    elseif col > coltop + colsize
+                        error("failed to find end of column")
                     end
                     # Fill with NaN to mark a non-structural zero which we can replace
-                    # with zero later
-                    M[row,i] = NaN
+                    # with zero later.
+                    # Have to insert 'by hand' because SparseMatrixCSR doesn't support
+                    # adding an entry outside the sparsity pattern.
+                    insert!(nzval, jmin - 1 + col, 0.0)
+                    insert!(colval, jmin - 1 + col, col)
+                    for j ∈ col+1:M.m+1
+                        rowptr[j] += 1
+                    end
                 end
             end
-        end
-    end
-
-    # Replace the NaNs we just added with zeros.
-    nzval = M.nzval
-    for i ∈ eachindex(nzval)
-        if isnan(nzval[i])
-            nzval[i] = zero(Tf)
         end
     end
 
