@@ -67,7 +67,6 @@ using LinearAlgebra.BLAS: trsv!, gemm!
 using MPI
 using SparseArrays
 using SparseArrays: AbstractSparseMatrixCSC
-using StatsBase: mean
 
 import Base: getindex, setindex!, size, sizehint!, resize!
 import LinearAlgebra: ldiv!, lu!
