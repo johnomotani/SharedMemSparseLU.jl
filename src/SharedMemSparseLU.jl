@@ -110,8 +110,8 @@ function fill_in_columns!(M::SparseMatrixCSC{Tf,Ti}) where {Tf,Ti}
             # There are some missing rows, because their matrix elements are zero.
             initial_row_values = rowval[jmin:jmax]
             rowleft = first(initial_row_values) - 1
+            row = rowleft + 1
             for i ∈ 1:length(initial_row_values)-1
-                row = rowleft + i
                 while true
                     row += 1
                     if initial_row_values[i+1] == row
@@ -155,8 +155,8 @@ function fill_in_rows!(M::SparseMatrixCSR{1,Tf,Ti}) where {Tf,Ti}
             # There are some missing columns, because their matrix elements are zero.
             initial_col_values = colval[jmin:jmax]
             coltop = first(initial_col_values) - 1
+            col = coltop + 1
             for i ∈ 1:length(initial_col_values)-1
-                col = coltop + i
                 while true
                     col += 1
                     if initial_col_values[i+1] == col
@@ -170,7 +170,7 @@ function fill_in_rows!(M::SparseMatrixCSR{1,Tf,Ti}) where {Tf,Ti}
                     # adding an entry outside the sparsity pattern.
                     insert!(nzval, jmin - 1 + col, 0.0)
                     insert!(colval, jmin - 1 + col, col)
-                    for j ∈ col+1:M.m+1
+                    for j ∈ row+1:M.m+1
                         rowptr[j] += 1
                     end
                 end
