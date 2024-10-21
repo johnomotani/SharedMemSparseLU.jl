@@ -365,9 +365,9 @@ function get_chunking_parameters(chunk_size, m::Ti, n::Ti, L::SparseMatrixCSC{Tf
         elseif comm_rank == 0
             # Keep a rectangular chunk the same size as the triangular chunk, so that this
             # solve fills out all the entries needed for the next triangular solve.
-            lsolve_row_ranges[chunk] = rectangular_rowmin : min(m, rectangular_rowmin, rectangular_rowmin + chunk_size - 1)
+            lsolve_row_ranges[chunk] = rectangular_rowmin : min(m, rectangular_rowmax, rectangular_rowmin + chunk_size - 1)
         else
-            other_procs_rowmin = min(m, rectangular_rowmin, rectangular_rowmin + chunk_size - 1) + 1
+            other_procs_rowmin = min(m, rectangular_rowmax, rectangular_rowmin + chunk_size - 1) + 1
 
             if comm_rank == comm_size - 1
                 # Last rank needs to go up to rectangular_rowmax even if that is past
