@@ -73,9 +73,9 @@ function runtests()
         end
 
         @testset "lsolve! sparse" begin
-            @testset "$n" for n ∈ 2:nmax
+            @testset "$nelement" for nelement ∈ 2:nmax
                 if comm_rank == 0
-                    A = test_matrix(rng)
+                    A = test_matrix(rng, nelement, 5)
                 else
                     A = nothing
                 end
@@ -143,9 +143,9 @@ function runtests()
         end
 
         @testset "rsolve! sparse" begin
-            @testset "$n" for n ∈ 2:nmax
+            @testset "$nelement" for nelement ∈ 2:nmax
                 if comm_rank == 0
-                    A = test_matrix(rng)
+                    A = test_matrix(rng, nelement, 5)
                 else
                     A = nothing
                 end
@@ -257,9 +257,9 @@ function runtests()
         end
 
         @testset "sparse matrix" begin
-            @testset "$n" for n ∈ 1:nmax
+            @testset "$nelement" for nelement ∈ 1:nmax
                 if comm_rank == 0
-                    A = test_matrix(rng)
+                    A = test_matrix(rng, nelement, 5)
                 else
                     A = nothing
                 end
@@ -303,7 +303,7 @@ function runtests()
 
                 # Check we can update the matrix
                 if comm_rank == 0
-                    A = test_matrix(rng)
+                    A = test_matrix(rng, nelement, 5)
                 else
                     A = nothing
                 end
