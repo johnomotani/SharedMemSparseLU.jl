@@ -365,16 +365,16 @@ function get_chunking_parameters(chunk_size, m::Ti, n::Ti, L::SparseMatrixCSC{Tf
         elseif comm_rank == 0
             # Keep a rectangular chunk the same size as the triangular chunk, so that this
             # solve fills out all the entries needed for the next triangular solve.
-            lsolve_row_ranges[chunk] = rectangular_rowmin : min(m, rectangular_rowmin + chunk_size - 1)
+            lsolve_row_ranges[chunk] = rectangular_rowmin : min(m, rectangular_rowmin, rectangular_rowmin + chunk_size - 1)
         else
-            other_procs_rowmin = min(m, rectangular_rowmin + chunk_size - 1) + 1
+            other_procs_rowmin = min(m, rectangular_rowmin, rectangular_rowmin + chunk_size - 1) + 1
 
             if comm_rank == comm_size - 1
                 # Last rank needs to go up to rectangular_rowmax even if that is past
                 # the end of the 'regular' chunks.
-                rsolve_row_ranges[chunk] = other_procs_rowmin + comm_rank * lsolve_row_chunk_size : rectangular_rowmax
+                lsolve_row_ranges[chunk] = other_procs_rowmin + (comm_rank - 1) * lsolve_row_chunk_size : rectangular_rowmax
             else
-                rsolve_row_ranges[chunk] = other_procs_rowmin + comm_rank * lsolve_row_chunk_size : min(rectangular_rowmax, other_procs_rowmin + (comm_rank + 1) * lsolve_row_chunk_size - 1)
+                lsolve_row_ranges[chunk] = other_procs_rowmin + (comm_rank - 1) * lsolve_row_chunk_size : min(rectangular_rowmax, other_procs_rowmin + comm_rank * lsolve_row_chunk_size - 1)
             end
         end
     end
@@ -425,15 +425,15 @@ function get_chunking_parameters(chunk_size, m::Ti, n::Ti, L::SparseMatrixCSC{Tf
         elseif comm_rank == 0
             # Keep a rectangular chunk the same size as the triangular chunk, so that this
             # solve fills out all the entries needed for the next triangular solve.
-            rsolve_row_ranges[chunk] = max(1, rectangular_rowmax - chunk_size + 1) : rectangular_rowmax
+            rsolve_row_ranges[chunk] = max(1, rectangular_rowmin, rectangular_rowmax - chunk_size + 1) : rectangular_rowmax
         else
-            other_procs_rowmax = max(1, rectangular_rowmax - chunk_size + 1) - 1
+            other_procs_rowmax = max(1, rectangular_rowmin, rectangular_rowmax - chunk_size + 1) - 1
             if comm_rank == comm_size - 1
                 # Last rank needs to go down to rectangular_rowmin even if that is past
                 # the end of the 'regular' chunks.
-                rsolve_row_ranges[chunk] = rectangular_rowmin : other_procs_rowmax - comm_rank * rsolve_row_chunk_size
+                rsolve_row_ranges[chunk] = rectangular_rowmin : other_procs_rowmax - (comm_rank - 1) * rsolve_row_chunk_size
             else
-                rsolve_row_ranges[chunk] = max(rectangular_rowmin, other_procs_rowmax - (comm_rank + 1) * rsolve_row_chunk_size + 1) : other_procs_rowmax - comm_rank * rsolve_row_chunk_size
+                rsolve_row_ranges[chunk] = max(rectangular_rowmin, other_procs_rowmax - comm_rank * rsolve_row_chunk_size + 1) : other_procs_rowmax - (comm_rank - 1) * rsolve_row_chunk_size
             end
         end
     end
@@ -857,7 +857,7 @@ function lsolve!(F::ParallelSparseLU{Tf,Ti,TLU}, x) where {Tf,Ti,TLU}
     total_chunks = F.total_chunks
     comm = F.comm
     comm_next_proc = F.comm_next_proc
-    comm_prev_proc = F.comm_next_proc
+    comm_prev_proc = F.comm_prev_proc
     comm_rank = F.comm_rank
     comm_size = F.comm_size
 
@@ -996,7 +996,7 @@ function rsolve!(F::ParallelSparseLU{Tf,Ti,TLU}, x) where {Tf,Ti,TLU}
     total_chunks = F.total_chunks
     comm = F.comm
     comm_next_proc = F.comm_next_proc
-    comm_prev_proc = F.comm_next_proc
+    comm_prev_proc = F.comm_prev_proc
     comm_rank = F.comm_rank
     comm_size = F.comm_size
 
@@ -1074,6 +1074,18 @@ function rsolve!(F::ParallelSparseLU{Tf,Ti,TLU}, x) where {Tf,Ti,TLU}
             # Do chunk=1 first, here no previous column chunk to wait for.
             chunk = 1
 
+            # Need to wait for rank-0 to finish its triangular block on this
+            # column-chunk.
+            req_rank0 = MPI.Ibarrier(comm)
+            MPI.Wait(req_rank0)
+
+            # Multiply rectangular chunk.
+            gemm!('N', 'N', one(Tf), U_chunks[chunk], @view(x[col_ranges[chunk]]),
+                  one(Tf), @view(x[row_ranges[chunk]]))
+
+            # Signal to 'prev proc' that we have finished this rectangular chunk. We do
+            # not need to wait for 'prev proc'
+            MPI.Ibarrier(comm_prev_proc)
         elseif total_chunks == 2
             # Signal to 'prev proc' that we have finished this rectangular chunk. We do
             # not need to wait for 'prev proc'
