@@ -146,8 +146,11 @@ mutable struct ParallelSparseLU{Tf, Ti,
         comm_size = MPI.Comm_size(comm)
 
         if chunk_size === nothing
-            chunk_size = max(A.n, 8 * comm_size)
+            # Pick a default chunk size.
+            chunk_size = 8 * comm_size
         end
+        # chunk_size cannot be larger than size of matrix
+        chunk_size = min(chunk_size, A.n)
 
         if comm_rank == 0 && A === nothing
             error("A matrix must be passed on rank-0 of communicator")
@@ -295,7 +298,8 @@ mutable struct ParallelSparseLU{Tf, Ti,
                 get_chunking_parameters(chunk_size, m, n, L, U, comm_rank, comm_size)
 
         L_chunks, U_chunks = allocate_chunks(Tf, total_chunks, chunk_size,
-                                             lsolve_row_ranges, rsolve_row_ranges,
+                                             lsolve_col_ranges, lsolve_row_ranges,
+                                             rsolve_col_ranges, rsolve_row_ranges,
                                              comm_rank)
 
         fill_chunks!(total_chunks, L, L_chunks, lsolve_col_ranges, lsolve_row_ranges, U,
@@ -379,40 +383,47 @@ function get_chunking_parameters(chunk_size, m::Ti, n::Ti, L::SparseMatrixCSC{Tf
            rsolve_col_ranges, rsolve_row_ranges
 end
 
-function allocate_chunks(Tf, total_chunks, chunk_size, lsolve_row_ranges,
-                         rsolve_row_ranges, comm_rank)
+function allocate_chunks(Tf, total_chunks, chunk_size, lsolve_col_ranges,
+                         lsolve_row_ranges, rsolve_col_ranges, rsolve_row_ranges,
+                         comm_rank)
     if comm_rank == 0
         # Rank-0 needs matrices for both triangular solve and matrix-multiply
         L_chunks = Vector{Matrix{Tf}}(undef, 2 * total_chunks)
         for chunk ∈ 1:total_chunks
+            col_size = length(lsolve_col_ranges[chunk])
+
             # Triangular chunk
-            L_chunks[2 * chunk - 1] = zeros(Tf, chunk_size, chunk_size)
+            L_chunks[2 * chunk - 1] = zeros(Tf, col_size, col_size)
 
             # Rectangular chunk
-            L_chunks[2 * chunk] = zeros(Tf, length(lsolve_row_ranges[chunk]), chunk_size)
+            L_chunks[2 * chunk] = zeros(Tf, length(lsolve_row_ranges[chunk]), col_size)
         end
     else
         # Other ranks only need matrices for matrix-multiply
         L_chunks = Vector{Matrix{Tf}}(undef, total_chunks)
         for chunk ∈ 1:total_chunks
-            L_chunks[chunk] = zeros(Tf, length(lsolve_row_ranges[chunk]), chunk_size)
+            L_chunks[chunk] = zeros(Tf, length(lsolve_row_ranges[chunk]),
+                                    length(lsolve_col_ranges[chunk]))
         end
     end
     if comm_rank == 0
         # Rank-0 needs matrices for both triangular solve and matrix-multiply
         U_chunks = Vector{Matrix{Tf}}(undef, 2 * total_chunks)
         for chunk ∈ 1:total_chunks
+            col_size = length(rsolve_col_ranges[chunk])
+
             # Triangular chunk
-            U_chunks[2 * chunk - 1] = zeros(Tf, chunk_size, chunk_size)
+            U_chunks[2 * chunk - 1] = zeros(Tf, col_size, col_size)
 
             # Rectangular chunk
-            U_chunks[2 * chunk] = zeros(Tf, length(rsolve_row_ranges[chunk]), chunk_size)
+            U_chunks[2 * chunk] = zeros(Tf, length(rsolve_row_ranges[chunk]), col_size)
         end
     else
         # Other ranks only need matrices for matrix-multiply
         U_chunks = Vector{Matrix{Tf}}(undef, total_chunks)
         for chunk ∈ 1:total_chunks
-            U_chunks[chunk] = zeros(Tf, length(rsolve_row_ranges[chunk]), chunk_size)
+            U_chunks[chunk] = zeros(Tf, length(rsolve_row_ranges[chunk]),
+                                    length(rsolve_col_ranges[chunk]))
         end
     end
 
@@ -445,7 +456,9 @@ function fill_chunks!(total_chunks, L, L_chunks, lsolve_col_ranges, lsolve_row_r
                         triangular_chunk[row - colmin + 1, col - colmin + 1] = L_nzval[j]
                     else
                         # Goes in rectangular chunk
-                        rectangular_chunk[row - rectangular_rowmin + 1, col - colmin + 1] = L_nzval[j]
+                        # -'ve sign because we need to subtract bits of L.x from x when
+                        # this chunk is applied, not add them.
+                        rectangular_chunk[row - rectangular_rowmin + 1, col - colmin + 1] = -L_nzval[j]
                     end
                 end
             end
@@ -478,7 +491,9 @@ function fill_chunks!(total_chunks, L, L_chunks, lsolve_col_ranges, lsolve_row_r
                         triangular_chunk[row - colmin + 1, col - colmin + 1] = U_nzval[j]
                     else
                         # Goes in rectangular chunk
-                        rectangular_chunk[row - rectangular_rowmin + 1, col - colmin + 1] = U_nzval[j]
+                        # -'ve sign because we need to subtract bits of U.x from x when
+                        # this chunk is applied, not add them.
+                        rectangular_chunk[row - rectangular_rowmin + 1, col - colmin + 1] = -U_nzval[j]
                     end
                 end
             end
@@ -547,7 +562,8 @@ function allocate_shared(F::ParallelSparseLU{Tf,Ti}, dims...; int=false,
     return array
 end
 
-function lu!(F::ParallelSparseLU, A::Union{SparseMatrixCSC,Nothing})
+function lu!(F::ParallelSparseLU{Tf,Ti},
+             A::Union{SparseMatrixCSC{Tf,Ti},Nothing}) where {Tf,Ti}
     comm = F.comm
     MPI.Barrier(comm)
     if F.comm_rank == 0
@@ -556,8 +572,8 @@ function lu!(F::ParallelSparseLU, A::Union{SparseMatrixCSC,Nothing})
         new_U = F.lu_object.U
 
         # If any arrays changed size then we need to reallocate the arrays
-        reallocate = Ref(F.L.colval != new_L.colval
-                         || F.L.rowptr != new_L.rowptr
+        reallocate = Ref(F.L.rowval != new_L.rowval
+                         || F.L.colptr != new_L.colptr
                          || size(F.L.nzval) != size(new_L.nzval)
                          || F.U.rowval != new_U.rowval
                          || F.U.colptr != new_U.colptr
@@ -651,7 +667,8 @@ function lu!(F::ParallelSparseLU, A::Union{SparseMatrixCSC,Nothing})
                 get_chunking_parameters(F.chunk_size, F.m, F.n, F.L, F.U, F.comm_rank,
                                         F.comm_size)
         F.L_chunks, F.U_chunks = allocate_chunks(Tf, F.total_chunks, F.chunk_size,
-                                                 F.lsolve_row_ranges, F.rsolve_row_ranges,
+                                                 F.lsolve_col_ranges, F.lsolve_row_ranges,
+                                                 F.rsolve_col_ranges, F.rsolve_row_ranges,
                                                  F.comm_rank)
 
     end
@@ -765,7 +782,7 @@ function lsolve!(F::ParallelSparseLU{Tf,Ti,TLU}, x) where {Tf,Ti,TLU}
 
             # Multiply rectangular chunk.
             gemm!('N', 'N', one(Tf), L_chunks[2 * chunk], @view(x[col_ranges[chunk]]),
-                  zero(Tf), @view(x[row_ranges[chunk]]))
+                  one(Tf), @view(x[row_ranges[chunk]]))
         end
     else
         error("not implemented yet")
@@ -779,7 +796,7 @@ end
 
 Solve `U*x = b`, where `F.U` is the upper triangular factor of a matrix.
 """
-function rsolve!(x, F::ParallelSparseLU, b)
+function rsolve!(F::ParallelSparseLU{Tf,Ti,TLU}, x) where {Tf,Ti,TLU}
     U_chunks = F.U_chunks
     col_ranges = F.rsolve_col_ranges
     row_ranges = F.rsolve_row_ranges
@@ -797,7 +814,7 @@ function rsolve!(x, F::ParallelSparseLU, b)
 
             # Multiply rectangular chunk.
             gemm!('N', 'N', one(Tf), U_chunks[2 * chunk], @view(x[col_ranges[chunk]]),
-                  zero(Tf), @view(x[row_ranges[chunk]]))
+                  one(Tf), @view(x[row_ranges[chunk]]))
         end
     else
         error("not implemented yet")
