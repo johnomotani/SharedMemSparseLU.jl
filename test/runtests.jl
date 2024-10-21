@@ -4,7 +4,6 @@ using LinearAlgebra
 using MPI
 using Random
 using SparseArrays
-using SparseMatricesCSR
 using Test
 
 using SharedMemSparseLU
@@ -55,12 +54,14 @@ function runtests()
 
                 # Create rhs
                 b = allocate_shared(A_lu, n)
+                x = allocate_shared(A_lu, n)
                 if comm_rank == 0
                     b .= rand(rng, Tf, n)
+                    x .= b
                 end
-                x = allocate_shared(A_lu, n)
+                MPI.Barrier(comm)
 
-                lsolve!(x, A_lu, b)
+                lsolve!(A_lu, x)
                 MPI.Barrier(comm)
 
                 if comm_rank == 0
@@ -91,12 +92,14 @@ function runtests()
 
                 # Create rhs
                 b = allocate_shared(A_lu, n)
+                x = allocate_shared(A_lu, n)
                 if comm_rank == 0
                     b .= rand(rng, Tf, n)
+                    x .= b
                 end
-                x = allocate_shared(A_lu, n)
+                MPI.Barrier(comm)
 
-                lsolve!(x, A_lu, b)
+                lsolve!(A_lu, x)
                 MPI.Barrier(comm)
 
                 if comm_rank == 0
@@ -120,15 +123,15 @@ function runtests()
 
                 # Create rhs
                 b = allocate_shared(A_lu, n)
-                wrk = allocate_shared(A_lu, n)
+                x = allocate_shared(A_lu, n)
                 if comm_rank == 0
                     b .= rand(rng, Tf, n)
                     # rsolve!() will modify its third argument, so work with a copy
-                    wrk .= b
+                    x .= b
                 end
-                x = allocate_shared(A_lu, n)
+                MPI.Barrier(comm)
 
-                rsolve!(x, A_lu, wrk)
+                rsolve!(A_lu, x)
                 MPI.Barrier(comm)
 
                 if comm_rank == 0
@@ -159,15 +162,15 @@ function runtests()
 
                 # Create rhs
                 b = allocate_shared(A_lu, n)
-                wrk = allocate_shared(A_lu, n)
+                x = allocate_shared(A_lu, n)
                 if comm_rank == 0
                     b .= rand(rng, Tf, n)
                     # rsolve!() will modify its third argument, so work with a copy
-                    wrk .= b
+                    x .= b
                 end
-                x = allocate_shared(A_lu, n)
+                MPI.Barrier(comm)
 
-                rsolve!(x, A_lu, wrk)
+                rsolve!(A_lu, x)
                 MPI.Barrier(comm)
 
                 if comm_rank == 0
