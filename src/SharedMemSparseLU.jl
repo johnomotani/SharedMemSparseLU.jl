@@ -66,120 +66,10 @@ using LinearAlgebra
 using MPI
 using SparseArrays
 using SparseArrays: AbstractSparseMatrixCSC
-using SparseMatricesCSR
 using StatsBase: mean
 
 import Base: getindex, setindex!, size, sizehint!, resize!
 import LinearAlgebra: ldiv!, lu!
-
-# Ideally this functionality would be provided by SparseArrays.jl, but probably will not b
-# because that package does not define/include a SparseMatrixCSR type. As a workaround,
-# define this function ourselves - somewhat hacky because this depends on internals of
-# SparseArrays.jl, so may break. This is a hacked copy of
-# https://github.com/JuliaSparse/SparseArrays.jl/blob/313a04f4a78bbc534f89b6b4d9c598453e2af17c/src/solvers/umfpack.jl#L842-L857
-using SparseArrays.UMFPACK: UmfpackLU, umfpack_numeric!, umf_lunz, @isok,
-                            umfpack_dl_get_numeric, increment!
-function get_L_matrix_CSR(F::UmfpackLU{Tf,Ti}) where {Tf,Ti}
-    umfpack_numeric!(F)        # ensure the numeric decomposition exists
-    (lnz, unz, n_row, n_col, nz_diag) = umf_lunz(F)
-    Lp = Vector{Ti}(undef, n_row + 1)
-    # L is returned in CSR (compressed sparse row) format
-    Lj = Vector{Ti}(undef, lnz)
-    Lx = Vector{Tf}(undef, lnz)
-    @isok umfpack_dl_get_numeric(
-                     Lp, Lj, Lx,
-                     C_NULL, C_NULL, C_NULL,
-                     C_NULL, C_NULL, C_NULL,
-                     C_NULL, C_NULL, F.numeric)
-    return SparseMatrixCSR{1}(n_row, n_col, increment!(Lp), increment!(Lj), Lx)
-end
-
-"""
-    fill_in_columns!(M::SparseMatrixCSC)
-
-Add non-structural zeros so that each column in `M` contains consecutive rows.
-"""
-function fill_in_columns!(M::SparseMatrixCSC{Tf,Ti}) where {Tf,Ti}
-    for col ∈ 1:M.n
-        colptr = M.colptr
-        jmin = colptr[col]
-        jmax = colptr[col+1] - 1
-        rowval = M.rowval
-        rowsize = rowval[jmax] - rowval[jmin]
-        if rowsize > jmax - jmin
-            # There are some missing rows, because their matrix elements are zero.
-            initial_row_values = rowval[jmin:jmax]
-            rowleft = first(initial_row_values) - 1
-            row = rowleft + 1
-            for i ∈ 1:length(initial_row_values)-1
-                while true
-                    row += 1
-                    if initial_row_values[i+1] == row
-                        break
-                    elseif row > rowleft + rowsize
-                        error("failed to find end of row")
-                    end
-                    # Fill with NaN to mark a non-structural zero which we can replace
-                    # with zero later
-                    M[i,col] = NaN
-                end
-            end
-        end
-    end
-
-    # Replace the NaNs we just added with zeros.
-    nzval = M.nzval
-    for i ∈ eachindex(nzval)
-        if isnan(nzval[i])
-            nzval[i] = zero(Tf)
-        end
-    end
-
-    return nothing
-end
-
-"""
-    fill_in_rows!(M::SparseMatrixCSR)
-
-Add non-structural zeros so that each row in `M` contains consecutive columns.
-"""
-function fill_in_rows!(M::SparseMatrixCSR{1,Tf,Ti}) where {Tf,Ti}
-    rowptr = M.rowptr
-    colval = M.colval
-    nzval = M.nzval
-    for row ∈ 1:M.m
-        jmin = rowptr[row]
-        jmax = rowptr[row+1] - 1
-        colsize = colval[jmax] - colval[jmin]
-        if colsize > jmax - jmin
-            # There are some missing columns, because their matrix elements are zero.
-            initial_col_values = colval[jmin:jmax]
-            coltop = first(initial_col_values) - 1
-            col = coltop + 1
-            for i ∈ 1:length(initial_col_values)-1
-                while true
-                    col += 1
-                    if initial_col_values[i+1] == col
-                        break
-                    elseif col > coltop + colsize
-                        error("failed to find end of column")
-                    end
-                    # Fill with NaN to mark a non-structural zero which we can replace
-                    # with zero later.
-                    # Have to insert 'by hand' because SparseMatrixCSR doesn't support
-                    # adding an entry outside the sparsity pattern.
-                    insert!(nzval, jmin - 1 + col, 0.0)
-                    insert!(colval, jmin - 1 + col, col)
-                    for j ∈ row+1:M.m+1
-                        rowptr[j] += 1
-                    end
-                end
-            end
-        end
-    end
-
-    return nothing
-end
 
 function allocate_shared(comm::MPI.Comm, T, dims...)
     comm_rank = MPI.Comm_rank(comm)
@@ -221,7 +111,7 @@ mutable struct ParallelSparseLU{Tf, Ti,
                                 TLU <: Union{SparseArrays.UMFPACK.UmfpackLU,Nothing}}
     m::Ti
     n::Ti
-    L::SparseMatrixCSR{1,Tf,Ti}
+    L::SparseMatrixCSC{Tf,Ti}
     U::SparseMatrixCSC{Tf,Ti}
     p::Vector{Ti}
     q::Vector{Ti}
@@ -234,21 +124,31 @@ mutable struct ParallelSparseLU{Tf, Ti,
     comm_size::Ti
     comm_prev_proc::MPI.Comm
     comm_next_proc::MPI.Comm
+    chunk_width::Ti
     wrk_range::UnitRange{Int64}
-    L_row_sizes::Vector{Ti}
+    chunk_width::Ti
+    chunk_size::Ti
+    total_chunks::Ti
+    L_chunks::Vector{Matrix{Tf}}
     lsolve_col_ranges::Vector{UnitRange{Int64}}
-    lsolve_x_ref::Ref{Tf}
-    U_col_sizes::Vector{Ti}
+    lsolve_row_ranges::Vector{UnitRange{Int64}}
+    U_chunks::Vector{Matrix{Tf}}
+    rsolve_col_ranges::Vector{UnitRange{Int64}}
     rsolve_row_ranges::Vector{UnitRange{Int64}}
     MPI_Win_store::Vector{MPI.Win}
     MPI_Win_store_internal::Vector{MPI.Win}
 
     function ParallelSparseLU{Tf,Ti}(A::Union{SparseMatrixCSC{Tf,Ti},Nothing},
-                                     comm=MPI.COMM_WORLD) where {Tf,Ti}
+                                     comm=MPI.COMM_WORLD,
+                                     chunk_width=nothing) where {Tf,Ti}
         # Use `lu()` from LinearAlgebra to calculate the L and U factors
 
         comm_rank = MPI.Comm_rank(comm)
         comm_size = MPI.Comm_size(comm)
+
+        if chunk_width === nothing
+            chunk_width = 8 * comm_size
+        end
 
         if comm_rank == 0 && A === nothing
             error("A matrix must be passed on rank-0 of communicator")
@@ -291,10 +191,8 @@ mutable struct ParallelSparseLU{Tf, Ti,
 
         if comm_rank == 0
             lu_object = lu(A)
-            L_serial = get_L_matrix_CSR(lu_object)
-            fill_in_rows!(L_serial)
+            L_serial = lu_object.L
             U_serial = lu_object.U
-            fill_in_columns!(U_serial)
             m, n = size(A)
             this_length[] = m
             MPI.Bcast!(this_length, comm)
@@ -395,19 +293,29 @@ mutable struct ParallelSparseLU{Tf, Ti,
         wrk, win = allocate_shared(comm, Tf, m)
         push!(MPI_Win_store, win)
 
-        wrk_range, lsolve_col_ranges, rsolve_row_ranges =
-            get_chunking_parameters(m, n, L, U, comm_rank, comm_size)
+        wrk_range, chunk_size, total_chunks, lsolve_col_ranges, lsolve_row_ranges,
+            rsolve_col_ranges, rsolve_row_ranges =
+                get_chunking_parameters(chunk_width, m, n, L, U, comm_rank, comm_size)
+
+        L_chunks, U_chunks = allocate_chunks(Tf, total_chunks, chunk_size,
+                                             lsolve_row_ranges, rsolve_row_ranges)
+
+        fill_chunks!(L, L_chunks, lsolve_col_ranges, lsolve_row_ranges, U, U_chunks,
+                     rsolve_col_ranges, rsolve_row_ranges)
 
         return new{Tf, Ti, typeof(lu_object)}(m, n, L, U, p, q, Rs, wrk, lu_object, comm,
                                               comm_rank, comm_size, comm_prev_proc,
-                                              comm_next_proc, wrk_range, L_row_sizes,
-                                              lsolve_col_ranges, Ref(zero(Tf)),
-                                              U_col_sizes, rsolve_row_ranges,
+                                              comm_next_proc, chunk_width, wrk_range,
+                                              chunk_size, total_chunks, L_chunks,
+                                              lsolve_col_ranges, lsolve_row_ranges,
+                                              rsolve_col_ranges, rsolve_row_ranges,
                                               MPI_Win_store, MPI_Win_store_internal)
     end
 end
 
-function get_chunking_parameters(m::Ti, n::Ti, L, U, comm_rank, comm_size) where {Ti}
+function get_chunking_parameters(chunk_width, m::Ti, n::Ti, L::SparseMatrixCSR{1,Tf,Ti},
+                                 U::SparseMatrixCSC{Tf,Ti}, comm_rank,
+                                 comm_size) where {Tf,Ti}
     # Get a sub-range for this process to iterate over in `wrk` from a global index range.
     # Define chunk_size so that comm_size*chunk_size ≥ m, with equality if comm_size
     # divides m exactly.
@@ -416,76 +324,169 @@ function get_chunking_parameters(m::Ti, n::Ti, L, U, comm_rank, comm_size) where
     imax = min((comm_rank + 1) * chunk_size + 1 - 1, m)
     wrk_range = imin:imax
 
-    L_rowptr = L.rowptr
-    L_colval = L.colval
+    L_colptr = L.colptr
+    L_rowval = L.rowval
 
-    # Divide the off-diagonal elements of each row into `comm_size` chunks, each processed
-    # by a different rank.
-    lsolve_col_ranges = Vector{UnitRange{Int64}}(undef, m)
-    for row ∈ 1:m
-        # Indices of sub-diagonal values in this row.
-        jmin = L_rowptr[row]
-        # `L_rowptr[row+1]` is the first element of the next row. `L_rowptr[row+1]-1`
-        # would be the diagonal element of L, so the '-2' here is to skip that
-        # diagonal element.
-        jmax = L_rowptr[row+1] - 2
+    # Divide L matrix into chunks, and get the chunks that will be processed by this rank.
+    total_chunks = (m + chunk_width - 1) ÷ chunk_width
+    lsolve_row_ranges = Vector{UnitRange{Int64}}(undef, total_chunks)
+    lsolve_col_ranges = Vector{UnitRange{Int64}}(undef, total_chunks)
+    for chunk ∈ 1:total_chunks
+        colmin = (chunk - 1) * chunk_size + 1
+        colmax = min(m, chunk * chunk_size)
+        cols = colmin : colmax
+        lsolve_col_ranges[chunk] = cols
+        # Find the matrix size that would include all non-zeros in this chunk
+        rectangular_rowmin = colmax + 1
+        rectangular_rowmax = maximum(L_rowval[L_colptr[j+1]-1] for j ∈ cols)
+        if comm_size == 1
+            # Running in serial. Rank-0 has to take all the matrix entries.
 
-        row_size = jmax - jmin + 1
-        chunk_size = (row_size + comm_size - 1) ÷ comm_size
-        thisrank_jmin = jmin + comm_rank * chunk_size
-        thisrank_jmax = min(jmax, jmin + (comm_rank + 1) * chunk_size - 1)
-
-        # Ensure `comm_rank==comm_size-1` always handles the x[row-1] element, because it
-        # is the rank that writes this value when handling the previous row.
-        lastrank_jmin = jmin + (comm_size - 1) * chunk_size
-        lastrank_jmax = min(jmax, jmin + comm_size * chunk_size - 1)
-        if lastrank_jmax < lastrank_jmin && jmax ≥ jmin
-            if comm_rank == comm_size - 1
-                thisrank_jmin = thisrank_jmax
-            elseif jmax == thisrank_jmax && thisrank_jmax ≥ thisrank_jmin
-                thisrank_jmax -= 1
-            end
+            # Row range for the rectangular chunk - the triangular chunk is the same as
+            # the column range.
+            lsolve_row_ranges[chunk] = rectangular_rowmin : rectangular_rowmax
+        else
+            error("not implemented yet")
         end
-
-        lsolve_col_ranges[row] = thisrank_jmin:thisrank_jmax
     end
 
     U_colptr = U.colptr
     U_rowval = U.rowval
 
-    # Divide the off-diagonal elements of each column into `comm_size` chunks, each
-    # processed by a different rank.
-    rsolve_row_ranges = Vector{UnitRange{Int64}}(undef, n)
-    for col ∈ 1:n
-        # Indices of super-diagonal values in this column.
-        jmin = U_colptr[col]
-        # `U_colptr[row+1]` is the first element of the next column, `U_colptr[row+1]-1`
-        # would be the diagonal element of U, so the '-2' here is to skip that
-        # diagonal element.
-        jmax = U_colptr[col+1] - 2
+    # Divide U matrix into chunks, and get the chunks that will be processed by this rank.
+    total_chunks = (m + chunk_width - 1) ÷ chunk_width
+    rsolve_row_ranges = Vector{UnitRange{Int64}}(undef, total_chunks)
+    rsolve_col_ranges = Vector{UnitRange{Int64}}(undef, total_chunks)
+    for chunk ∈ 1:total_chunks
+        colmin = (total_chunks - chunk) * chunk_size + 1
+        colmax = min(m, (total_chunks - chunk + 1) * chunk_size)
+        cols = colmin : colmax
+        rsolve_col_ranges[chunk] = cols
+        # Find the matrix size that would include all non-zeros in this chunk
+        rectangular_rowmin = minimum(U_rowval[U_colptr[j]] for j ∈ cols)
+        rectangular_rowmax = colmin - 1
+        if comm_size == 1
+            # Running in serial. Rank-0 has to take all the matrix entries.
 
-        col_size = jmax - jmin + 1
-        chunk_size = (col_size + comm_size - 1) ÷ comm_size
-
-        thisrank_jmin = jmin + comm_rank * chunk_size
-        thisrank_jmax = min(jmax, jmin + (comm_rank + 1) * chunk_size - 1)
-
-        # Ensure `comm_rank==comm_size-1` always handles the x[col+1] element, because it
-        # is the rank that writes this value when handling the previous column.
-        lastrank_jmin = jmin + (comm_size - 1) * chunk_size
-        lastrank_jmax = min(jmax, jmin + comm_size * chunk_size - 1)
-        if lastrank_jmax < lastrank_jmin && jmax ≥ jmin
-            if comm_rank == comm_size - 1
-                thisrank_jmin = thisrank_jmax
-            elseif jmax == thisrank_jmax && thisrank_jmax ≥ thisrank_jmin
-                thisrank_jmax -= 1
-            end
+            # Row range for the rectangular chunk - the triangular chunk is the same as
+            # the column range.
+            rsolve_row_ranges[chunk] = rectangular_rowmin : rectangular_rowmax
+        else
+            error("not implemented yet")
         end
-
-        rsolve_row_ranges[col] = thisrank_jmin:thisrank_jmax
     end
 
-    return wrk_range, lsolve_col_ranges, rsolve_row_ranges
+
+    return wrk_range, chunk_size, total_chunks, lsolve_col_ranges, lsolve_row_ranges,
+           rsolve_col_ranges, rsolve_row_ranges
+end
+
+function allocate_chunks(Tf, total_chunks, chunk_size, lsolve_row_ranges, rsolve_row_ranges)
+    if comm_rank == 0
+        # Rank-0 needs matrices for both triangular solve and matrix-multiply
+        L_chunks = Vector{Matrix{Tf}}(undef, 2 * total_chunks)
+        for chunk ∈ 1:total_chunks
+            # Triangular chunk
+            L_chunks[2 * chunk - 1] = zeros(Tf, chunk_size, chunk_size)
+
+            # Rectangular chunk
+            L_chunks[chunk] = zeros(Tf, length(lsolve_row_ranges[chunk]), chunk_size)
+        end
+    else
+        # Other ranks only need matrices for matrix-multiply
+        L_chunks = Vector{Matrix{Tf}}(undef, total_chunks)
+        for chunk ∈ 1:total_chunks
+            L_chunks[2 * chunk] = zeros(Tf, length(lsolve_row_ranges[chunk]), chunk_size)
+        end
+    end
+    if comm_rank == 0
+        # Rank-0 needs matrices for both triangular solve and matrix-multiply
+        U_chunks = Vector{Matrix{Tf}}(undef, 2 * total_chunks)
+        for chunk ∈ 1:total_chunks
+            # Triangular chunk
+            U_chunks[2 * chunk - 1] = zeros(Tf, chunk_size, chunk_size)
+
+            # Rectangular chunk
+            U_chunks[2 * chunk] = zeros(Tf, length(rsolve_row_ranges[chunk]), chunk_size)
+        end
+    else
+        # Other ranks only need matrices for matrix-multiply
+        U_chunks = Vector{Matrix{Tf}}(undef, total_chunks)
+        for chunk ∈ 1:total_chunks
+            U_chunks[chunk] = zeros(Tf, length(rsolve_row_ranges[chunk]), chunk_size)
+        end
+    end
+
+    return L_chunks, U_chunks
+end
+
+function fill_chunks!(L, L_chunks, lsolve_col_ranges, lsolve_row_ranges, U, U_chunks,
+                      rsolve_col_ranges, rsolve_row_ranges)
+    # Fill L_chunks
+    L_colptr = L.colptr
+    L_rowval = L.rowval
+    L_nzval = L.nzval
+    for chunk ∈ 1:total_chunks
+        this_col_range = lsolve_col_ranges(chunk)
+        colmin = first(this_col_range)
+        colmax = last(this_col_range)
+        rectangular_rowmin = first(lsolve_row_ranges[chunk])
+        rectangular_rowmax = last(lsolve_row_ranges[chunk])
+        if comm_size == 1
+            # Running in serial. Rank-0 has to take all the matrix entries.
+            triangular_chunk = L_chunks[2 * chunk - 1]
+            rectangular_chunk = L_chunks[2 * chunk]
+
+            # Copy the non-zero entries from L into triangular_chunk and rectangular_chunk
+            for col ∈ this_col_range
+                for j ∈ L_colptr[col]:L_colptr[col+1]-1
+                    row = L_rowval[j]
+                    if row ≤ colmax
+                        # Goes in triangular chunk
+                        triangular_chunk[row - colmin + 1, col - colmin + 1] = L_nzvals[j]
+                    else
+                        # Goes in rectangular chunk
+                        rectangular_chunk[row - rectangular_rowmin + 1, col - colmin + 1] = L_nzvals[j]
+                    end
+                end
+            end
+        else
+            error("not implemented yet")
+        end
+    end
+
+    # Fill U_chunks
+    U_colptr = U.colptr
+    U_rowval = U.rowval
+    U_nzval = U.nzval
+    for chunk ∈ 1:total_chunks
+        this_col_range = rsolve_col_ranges(chunk)
+        colmin = first(this_col_range)
+        colmax = last(this_col_range)
+        rectangular_rowmin = first(rsolve_row_ranges[chunk])
+        rectangular_rowmax = last(rsolve_row_ranges[chunk])
+        if comm_size == 1
+            # Running in serial. Rank-0 has to take all the matrix entries.
+            triangular_chunk = U_chunks[2 * chunk - 1]
+            rectangular_chunk = U_chunks[2 * chunk]
+
+            # Copy the non-zero entries from L into triangular_chunk and rectangular_chunk
+            for col ∈ this_col_range
+                for j ∈ U_colptr[col]:U_colptr[col+1]-1
+                    row = U_rowval[j]
+                    if row ≥ colmin
+                        # Goes in triangular chunk
+                        triangular_chunk[row - colmin + 1, col - colmin + 1] = U_nzvals[j]
+                    else
+                        # Goes in rectangular chunk
+                        rectangular_chunk[row - rectangular_rowmin + 1, col - colmin + 1] = U_nzvals[j]
+                    end
+                end
+            end
+        else
+            error("not implemented yet")
+        end
+    end
 end
 
 function cleanup_ParallelSparseLU!(F::ParallelSparseLU)
@@ -552,10 +553,8 @@ function lu!(F::ParallelSparseLU, A::Union{SparseMatrixCSC,Nothing})
     MPI.Barrier(comm)
     if F.comm_rank == 0
         lu!(F.lu_object, A)
-        new_L = get_L_matrix_CSR(F.lu_object)
-        fill_in_rows!(new_L)
+        new_L = F.lu_object.L
         new_U = F.lu_object.U
-        fill_in_columns!(new_U)
 
         # If any arrays changed size then we need to reallocate the arrays
         reallocate = Ref(F.L.colval != new_L.colval
@@ -649,10 +648,20 @@ function lu!(F::ParallelSparseLU, A::Union{SparseMatrixCSC,Nothing})
     end
     if reallocate[]
         F.wrk_range, F.lsolve_col_ranges, F.rsolve_row_ranges =
-            get_chunking_parameters(F.m, F.n, F.L, F.U, F.comm_rank, F.comm_size)
+            get_chunking_parameters(F.chunk_width, F.m, F.n, F.L, F.U, F.comm_rank, F.comm_size)
         @. F.L_row_sizes = F.L.rowptr[2:end] - F.L.rowptr[1:end-1]
         @. F.U_col_sizes = F.U.colptr[2:end] - F.U.colptr[1:end-1]
+        F.wrk_range, F.chunk_size, F.total_chunks, F.lsolve_col_ranges,
+            F.lsolve_row_ranges, F.rsolve_col_ranges, F.rsolve_row_ranges =
+                get_chunking_parameters(F.chunk_width, F.m, F.n, F.L, F.U, F.comm_rank,
+                                        F.comm_size)
+        F.L_chunks, F.U_chunks = allocate_chunks(Tf, F.total_chunks, F.chunk_size,
+                                                 F.lsolve_row_ranges, F.rsolve_row_ranges)
+
     end
+    fill_chunks!(F.L, F.L_chunks, F.lsolve_col_ranges, F.lsolve_row_ranges, F.U,
+                 F.U_chunks, F.rsolve_col_ranges, F.rsolve_row_ranges)
+
     MPI.Barrier(comm)
     return nothing
 end
