@@ -144,13 +144,6 @@ mutable struct ParallelSparseLU{Tf, Ti,
         comm_rank = MPI.Comm_rank(comm)
         comm_size = MPI.Comm_size(comm)
 
-        if chunk_size === nothing
-            # Pick a default chunk size.
-            chunk_size = 8 * comm_size
-        end
-        # chunk_size cannot be larger than size of matrix
-        chunk_size = min(chunk_size, A.n)
-
         if comm_rank == 0 && A === nothing
             error("A matrix must be passed on rank-0 of communicator")
         end
@@ -170,19 +163,13 @@ mutable struct ParallelSparseLU{Tf, Ti,
             comm_prev_proc = comm_even_odd
             comm_next_proc = comm_odd_even
         end
-        if comm_size % 2 != 0
-            # Odd number of processes. In
-            # comm_even_odd the last process will not be connected to any other, and in
-            # comm_odd_even the first process will not be connected to any other. They need to
-            # be connected appropriately.
-            if comm_rank == 0
-                comm_prev_proc = MPI.Comm_split(comm, 0, comm_rank)
-            elseif comm_rank == comm_size - 1
-                comm_next_proc = MPI.Comm_split(comm, 0, comm_rank)
-            else
-                # Other processes do not need to participate in this communicator split.
-                MPI.Comm_split(comm, nothing, comm_rank)
-            end
+        if comm_rank == 0
+            # Don't ever need to wait for 'prev proc' on rank-0
+            comm_prev_proc = MPI.COMM_NULL
+        end
+        if comm_rank == comm_size - 1
+            # There is no 'next proc' that we need to wait for.
+            comm_next_proc = MPI.COMM_SELF
         end
 
         MPI_Win_store = MPI.Win[]
@@ -208,6 +195,13 @@ mutable struct ParallelSparseLU{Tf, Ti,
         end
         m = Ti(m)
         n = Ti(n)
+
+        if chunk_size === nothing
+            # Pick a default chunk size.
+            chunk_size = 8 * comm_size
+        end
+        # chunk_size cannot be larger than size of matrix
+        chunk_size = min(chunk_size, n)
 
         # Allocate and fill the L SparseMatrixCSC object
         ################################################
@@ -302,7 +296,7 @@ mutable struct ParallelSparseLU{Tf, Ti,
                                              comm_rank)
 
         fill_chunks!(total_chunks, L, L_chunks, lsolve_col_ranges, lsolve_row_ranges, U,
-                     U_chunks, rsolve_col_ranges, rsolve_row_ranges, comm_size)
+                     U_chunks, rsolve_col_ranges, rsolve_row_ranges, comm_rank, comm_size)
 
         return new{Tf, Ti, typeof(lu_object)}(m, n, L, U, p, q, Rs, wrk, lu_object, comm,
                                               comm_rank, comm_size, comm_prev_proc,
@@ -332,6 +326,28 @@ function get_chunking_parameters(chunk_size, m::Ti, n::Ti, L::SparseMatrixCSC{Tf
     total_chunks = (m + chunk_size - 1) ÷ chunk_size
     lsolve_row_ranges = Vector{UnitRange{Int64}}(undef, total_chunks)
     lsolve_col_ranges = Vector{UnitRange{Int64}}(undef, total_chunks)
+
+    L_colsizes = L_colptr[2:end] - L_colptr[1:end-1]
+    sort!(L_colsizes)
+
+    # Get the size such that ~90% of columns are below that size.
+    row_size_90 = L_colsizes[round(Ti, 0.9 * n)]
+
+    # Want a row_chunk_size that is fixed for all columns, so that we can set a
+    # synchronization pattern that guarantees that there are no race conditions for any
+    # chunk. Divide up row_size_90 into equally sized chunks, as this should be a
+    # reasonable division for most columns. For the columns that are too big, the last
+    # process will have a bigger chunk.
+    # However, make sure row_chunk_size is ≥chunk_size so that the rank-0 process's square
+    # chunk in the next column-chunk can always be calculated as soon as the rank-1
+    # process's chunk has completed.
+    if comm_size > 1
+        lsolve_row_chunk_size = (row_size_90 + (comm_size - 1) - 1) ÷ (comm_size - 1)
+        lsolve_row_chunk_size = max(chunk_size, lsolve_row_chunk_size)
+    else
+        lsolve_row_chunk_size = 0
+    end
+
     for chunk ∈ 1:total_chunks
         colmin = (chunk - 1) * chunk_size + 1
         colmax = min(m, chunk * chunk_size)
@@ -346,8 +362,20 @@ function get_chunking_parameters(chunk_size, m::Ti, n::Ti, L::SparseMatrixCSC{Tf
             # Row range for the rectangular chunk - the triangular chunk is the same as
             # the column range.
             lsolve_row_ranges[chunk] = rectangular_rowmin : rectangular_rowmax
+        elseif comm_rank == 0
+            # Keep a rectangular chunk the same size as the triangular chunk, so that this
+            # solve fills out all the entries needed for the next triangular solve.
+            lsolve_row_ranges[chunk] = rectangular_rowmin : min(m, rectangular_rowmin + chunk_size - 1)
         else
-            error("not implemented yet")
+            other_procs_rowmin = min(m, rectangular_rowmin + chunk_size - 1) + 1
+
+            if comm_rank == comm_size - 1
+                # Last rank needs to go up to rectangular_rowmax even if that is past
+                # the end of the 'regular' chunks.
+                rsolve_row_ranges[chunk] = other_procs_rowmin + comm_rank * lsolve_row_chunk_size : rectangular_rowmax
+            else
+                rsolve_row_ranges[chunk] = other_procs_rowmin + comm_rank * lsolve_row_chunk_size : min(rectangular_rowmax, other_procs_rowmin + (comm_rank + 1) * lsolve_row_chunk_size - 1)
+            end
         end
     end
 
@@ -358,6 +386,28 @@ function get_chunking_parameters(chunk_size, m::Ti, n::Ti, L::SparseMatrixCSC{Tf
     total_chunks = (m + chunk_size - 1) ÷ chunk_size
     rsolve_row_ranges = Vector{UnitRange{Int64}}(undef, total_chunks)
     rsolve_col_ranges = Vector{UnitRange{Int64}}(undef, total_chunks)
+
+    U_colsizes = U_colptr[2:end] - U_colptr[1:end-1]
+    sort!(U_colsizes)
+
+    # Get the size such that ~90% of columns are below that size.
+    row_size_90 = U_colsizes[round(Ti, 0.9 * n)]
+
+    # Want a row_chunk_size that is fixed for all columns, so that we can set a
+    # synchronization pattern that guarantees that there are no race conditions for any
+    # chunk. Divide up row_size_90 into equally sized chunks, as this should be a
+    # reasonable division for most columns. For the columns that are too big, the last
+    # process will have a bigger chunk.
+    # However, make sure row_chunk_size is ≥chunk_size so that the rank-0 process's square
+    # chunk in the next column-chunk can always be calculated as soon as the rank-1
+    # process's chunk has completed.
+    if comm_size > 1
+        rsolve_row_chunk_size = (row_size_90 + (comm_size - 1) - 1) ÷ (comm_size - 1)
+        rsolve_row_chunk_size = max(chunk_size, rsolve_row_chunk_size)
+    else
+        rsolve_row_chunk_size = 0
+    end
+
     for chunk ∈ 1:total_chunks
         colmin = (total_chunks - chunk) * chunk_size + 1
         colmax = min(m, (total_chunks - chunk + 1) * chunk_size)
@@ -372,8 +422,19 @@ function get_chunking_parameters(chunk_size, m::Ti, n::Ti, L::SparseMatrixCSC{Tf
             # Row range for the rectangular chunk - the triangular chunk is the same as
             # the column range.
             rsolve_row_ranges[chunk] = rectangular_rowmin : rectangular_rowmax
+        elseif comm_rank == 0
+            # Keep a rectangular chunk the same size as the triangular chunk, so that this
+            # solve fills out all the entries needed for the next triangular solve.
+            rsolve_row_ranges[chunk] = max(1, rectangular_rowmax - chunk_size + 1) : rectangular_rowmax
         else
-            error("not implemented yet")
+            other_procs_rowmax = max(1, rectangular_rowmax - chunk_size + 1) - 1
+            if comm_rank == comm_size - 1
+                # Last rank needs to go down to rectangular_rowmin even if that is past
+                # the end of the 'regular' chunks.
+                rsolve_row_ranges[chunk] = rectangular_rowmin : other_procs_rowmax - comm_rank * rsolve_row_chunk_size
+            else
+                rsolve_row_ranges[chunk] = max(rectangular_rowmin, other_procs_rowmax - (comm_rank + 1) * rsolve_row_chunk_size + 1) : other_procs_rowmax - comm_rank * rsolve_row_chunk_size
+            end
         end
     end
 
@@ -430,7 +491,8 @@ function allocate_chunks(Tf, total_chunks, chunk_size, lsolve_col_ranges,
 end
 
 function fill_chunks!(total_chunks, L, L_chunks, lsolve_col_ranges, lsolve_row_ranges, U,
-                      U_chunks, rsolve_col_ranges, rsolve_row_ranges, comm_size)
+                      U_chunks, rsolve_col_ranges, rsolve_row_ranges, comm_rank,
+                      comm_size)
     # Fill L_chunks
     L_colptr = L.colptr
     L_rowval = L.rowval
@@ -439,10 +501,9 @@ function fill_chunks!(total_chunks, L, L_chunks, lsolve_col_ranges, lsolve_row_r
         this_col_range = lsolve_col_ranges[chunk]
         colmin = first(this_col_range)
         colmax = last(this_col_range)
-        rectangular_rowmin = first(lsolve_row_ranges[chunk])
-        rectangular_rowmax = last(lsolve_row_ranges[chunk])
-        if comm_size == 1
-            # Running in serial. Rank-0 has to take all the matrix entries.
+        this_rectangular_row_range = lsolve_row_ranges[chunk]
+        rectangular_rowmin = first(this_rectangular_row_range)
+        if comm_rank == 0
             triangular_chunk = L_chunks[2 * chunk - 1]
             rectangular_chunk = L_chunks[2 * chunk]
 
@@ -453,7 +514,7 @@ function fill_chunks!(total_chunks, L, L_chunks, lsolve_col_ranges, lsolve_row_r
                     if row ≤ colmax
                         # Goes in triangular chunk
                         triangular_chunk[row - colmin + 1, col - colmin + 1] = L_nzval[j]
-                    else
+                    elseif row ∈ this_rectangular_row_range
                         # Goes in rectangular chunk
                         # -'ve sign because we need to subtract bits of L.x from x when
                         # this chunk is applied, not add them.
@@ -462,7 +523,21 @@ function fill_chunks!(total_chunks, L, L_chunks, lsolve_col_ranges, lsolve_row_r
                 end
             end
         else
-            error("not implemented yet")
+            rectangular_chunk = L_chunks[chunk]
+
+            # Copy the non-zero entries from L into rectangular_chunk
+            this_rectangular_row_range = lsolve_row_ranges[chunk]
+            for col ∈ this_col_range
+                for j ∈ L_colptr[col]:L_colptr[col+1]-1
+                    row = L_rowval[j]
+                    if row ∈ this_rectangular_row_range
+                        # Goes in rectangular chunk
+                        # -'ve sign because we need to subtract bits of L.x from x when
+                        # this chunk is applied, not add them.
+                        rectangular_chunk[row - rectangular_rowmin + 1, col - colmin + 1] = -L_nzval[j]
+                    end
+                end
+            end
         end
     end
 
@@ -474,10 +549,9 @@ function fill_chunks!(total_chunks, L, L_chunks, lsolve_col_ranges, lsolve_row_r
         this_col_range = rsolve_col_ranges[chunk]
         colmin = first(this_col_range)
         colmax = last(this_col_range)
-        rectangular_rowmin = first(rsolve_row_ranges[chunk])
-        rectangular_rowmax = last(rsolve_row_ranges[chunk])
-        if comm_size == 1
-            # Running in serial. Rank-0 has to take all the matrix entries.
+        this_rectangular_row_range = rsolve_row_ranges[chunk]
+        rectangular_rowmin = first(this_rectangular_row_range)
+        if comm_rank == 0
             triangular_chunk = U_chunks[2 * chunk - 1]
             rectangular_chunk = U_chunks[2 * chunk]
 
@@ -488,7 +562,7 @@ function fill_chunks!(total_chunks, L, L_chunks, lsolve_col_ranges, lsolve_row_r
                     if row ≥ colmin
                         # Goes in triangular chunk
                         triangular_chunk[row - colmin + 1, col - colmin + 1] = U_nzval[j]
-                    else
+                    elseif row ∈ this_rectangular_row_range
                         # Goes in rectangular chunk
                         # -'ve sign because we need to subtract bits of U.x from x when
                         # this chunk is applied, not add them.
@@ -497,7 +571,20 @@ function fill_chunks!(total_chunks, L, L_chunks, lsolve_col_ranges, lsolve_row_r
                 end
             end
         else
-            error("not implemented yet")
+            rectangular_chunk = U_chunks[chunk]
+
+            # Copy the non-zero entries from L into triangular_chunk and rectangular_chunk
+            for col ∈ this_col_range
+                for j ∈ U_colptr[col]:U_colptr[col+1]-1
+                    row = U_rowval[j]
+                    if row ∈ this_rectangular_row_range
+                        # Goes in rectangular chunk
+                        # -'ve sign because we need to subtract bits of U.x from x when
+                        # this chunk is applied, not add them.
+                        rectangular_chunk[row - rectangular_rowmin + 1, col - colmin + 1] = -U_nzval[j]
+                    end
+                end
+            end
         end
     end
 end
@@ -673,7 +760,7 @@ function lu!(F::ParallelSparseLU{Tf,Ti},
     end
     fill_chunks!(F.total_chunks, F.L, F.L_chunks, F.lsolve_col_ranges,
                  F.lsolve_row_ranges, F.U, F.U_chunks, F.rsolve_col_ranges,
-                 F.rsolve_row_ranges, F.comm_size)
+                 F.rsolve_row_ranges, F.comm_rank, F.comm_size)
 
     MPI.Barrier(comm)
     return nothing
@@ -769,22 +856,129 @@ function lsolve!(F::ParallelSparseLU{Tf,Ti,TLU}, x) where {Tf,Ti,TLU}
     row_ranges = F.lsolve_row_ranges
     total_chunks = F.total_chunks
     comm = F.comm
+    comm_next_proc = F.comm_next_proc
+    comm_prev_proc = F.comm_next_proc
     comm_rank = F.comm_rank
     comm_size = F.comm_size
 
     if comm_rank == 0
-        for chunk ∈ 1:total_chunks
+        if total_chunks > 2
+            # Do chunk=1 first, here no previous column chunk to wait for.
+            chunk = 1
+
             # Do triangular solve.
             # For the triangular part, the 'row ranges' are the same as 'col_ranges',
             # because this is a diagonal block of L.
             trsv!('L', 'N', 'U', L_chunks[2 * chunk - 1], @view(x[col_ranges[chunk]]))
 
+            # The triangular solve needs to complete before any other process starts using
+            # x[col_ranges[chunk]] for their rectangular block, but this process does not
+            # need to wait for them.
+            req = MPI.Ibarrier(comm)
+
             # Multiply rectangular chunk.
             gemm!('N', 'N', one(Tf), L_chunks[2 * chunk], @view(x[col_ranges[chunk]]),
                   one(Tf), @view(x[row_ranges[chunk]]))
         end
+
+        for chunk ∈ 2:total_chunks - 2
+            # Do triangular solve.
+            # For the triangular part, the 'row ranges' are the same as 'col_ranges',
+            # because this is a diagonal block of L.
+            trsv!('L', 'N', 'U', L_chunks[2 * chunk - 1], @view(x[col_ranges[chunk]]))
+
+            # The triangular solve needs to complete before any other process starts using
+            # x[col_ranges[chunk]] for their rectangular block, but this process does not
+            # need to wait for them.
+            req = MPI.Ibarrier(comm)
+
+            # Need to wait for 'next proc' to finish its rectangular block from the
+            # previous column-chunk before starting the rectangular block.
+            req = MPI.Ibarrier(comm_next_proc)
+            MPI.Wait(req)
+
+            # Multiply rectangular chunk.
+            gemm!('N', 'N', one(Tf), L_chunks[2 * chunk], @view(x[col_ranges[chunk]]),
+                  one(Tf), @view(x[row_ranges[chunk]]))
+        end
+
+        if total_chunks > 1
+            # In second-to-last chunk, the only possible rectangular block is the one we
+            # calculate, and no other process needs to wait for us.
+            chunk = total_chunks - 1
+
+            # Do triangular solve.
+            # For the triangular part, the 'row ranges' are the same as 'col_ranges',
+            # because this is a diagonal block of L.
+            trsv!('L', 'N', 'U', L_chunks[2 * chunk - 1], @view(x[col_ranges[chunk]]))
+
+            # Need to wait for 'next proc' to finish its rectangular block from the
+            # previous column-chunk before starting the rectangular block.
+            req = MPI.Ibarrier(comm_next_proc)
+            MPI.Wait(req)
+
+            # Multiply rectangular chunk.
+            gemm!('N', 'N', one(Tf), L_chunks[2 * chunk], @view(x[col_ranges[chunk]]),
+                  one(Tf), @view(x[row_ranges[chunk]]))
+        end
+
+        # In final chunk, there is nothing to wait for us after the solve, and no
+        # rectangular block to solve.
+        chunk = total_chunks
+
+        # Do triangular solve.
+        # For the triangular part, the 'row ranges' are the same as 'col_ranges',
+        # because this is a diagonal block of L.
+        trsv!('L', 'N', 'U', L_chunks[2 * chunk - 1], @view(x[col_ranges[chunk]]))
     else
-        error("not implemented yet")
+        if total_chunks > 2
+            # Do chunk=1 first, here no previous column chunk to wait for.
+            chunk = 1
+
+            # Need to wait for rank-0 to finish its triangular block on this
+            # column-chunk.
+            req_rank0 = MPI.Ibarrier(comm)
+            MPI.Wait(req_rank0)
+
+            # Multiply rectangular chunk.
+            gemm!('N', 'N', one(Tf), L_chunks[chunk], @view(x[col_ranges[chunk]]),
+                  one(Tf), @view(x[row_ranges[chunk]]))
+
+            # Signal to 'prev proc' that we have finished this rectangular chunk. We do
+            # not need to wait for 'prev proc'
+            MPI.Ibarrier(comm_prev_proc)
+        elseif total_chunks == 2
+            # Signal to 'prev proc' that we have finished this rectangular chunk. We do
+            # not need to wait for 'prev proc'
+            MPI.Ibarrier(comm_prev_proc)
+        end
+
+        for chunk ∈ 2:total_chunks - 2
+            # Need to wait for 'next proc' to finish its rectangular block from the
+            # previous column-chunk before starting the rectangular block.
+            req_next = MPI.Ibarrier(comm_next_proc)
+
+            # Also need to wait for rank-0 to finish its triangular block on this
+            # column-chunk.
+            req_rank0 = MPI.Ibarrier(comm)
+            MPI.Waitall([req_next, req_rank0])
+
+            # Multiply rectangular chunk.
+            gemm!('N', 'N', one(Tf), L_chunks[chunk], @view(x[col_ranges[chunk]]),
+                  one(Tf), @view(x[row_ranges[chunk]]))
+
+            # Signal to 'prev proc' that we have finished this rectangular chunk. We do
+            # not need to wait for 'prev proc'
+            MPI.Ibarrier(comm_prev_proc)
+        end
+
+        if total_chunks > 1
+            # In second-to-last chunk there is no work for this process to do, because the
+            # only rectangular chunk is the one on rank-0, so no need to signal to any other
+            # process to wait. Just need to mop up the MPI.Ibarrier() calls from
+            # total_chunks-2, but do not need to wait for them.
+            MPI.Ibarrier(comm_next_proc)
+        end
     end
 
     return nothing
@@ -801,22 +995,117 @@ function rsolve!(F::ParallelSparseLU{Tf,Ti,TLU}, x) where {Tf,Ti,TLU}
     row_ranges = F.rsolve_row_ranges
     total_chunks = F.total_chunks
     comm = F.comm
+    comm_next_proc = F.comm_next_proc
+    comm_prev_proc = F.comm_next_proc
     comm_rank = F.comm_rank
     comm_size = F.comm_size
 
     if comm_rank == 0
-        for chunk ∈ 1:total_chunks
+        if total_chunks > 2
+            # Do chunk=1 first, here no previous column chunk to wait for.
+            chunk = 1
+
             # Do triangular solve.
             # For the triangular part, the 'row ranges' are the same as 'col_ranges',
             # because this is a diagonal block of L.
             trsv!('U', 'N', 'N', U_chunks[2 * chunk - 1], @view(x[col_ranges[chunk]]))
 
+            # The triangular solve needs to complete before any other process starts using
+            # x[col_ranges[chunk]] for their rectangular block, but this process does not
+            # need to wait for them.
+            req = MPI.Ibarrier(comm)
+
             # Multiply rectangular chunk.
             gemm!('N', 'N', one(Tf), U_chunks[2 * chunk], @view(x[col_ranges[chunk]]),
                   one(Tf), @view(x[row_ranges[chunk]]))
         end
+
+        for chunk ∈ 2:total_chunks - 2
+            # Do triangular solve.
+            # For the triangular part, the 'row ranges' are the same as 'col_ranges',
+            # because this is a diagonal block of L.
+            trsv!('U', 'N', 'N', U_chunks[2 * chunk - 1], @view(x[col_ranges[chunk]]))
+
+            # The triangular solve needs to complete before any other process starts using
+            # x[col_ranges[chunk]] for their rectangular block, but this process does not
+            # need to wait for them.
+            req = MPI.Ibarrier(comm)
+
+            # Need to wait for 'next proc' to finish its rectangular block from the
+            # previous column-chunk before starting the rectangular block.
+            req = MPI.Ibarrier(comm_next_proc)
+            MPI.Wait(req)
+
+            # Multiply rectangular chunk.
+            gemm!('N', 'N', one(Tf), U_chunks[2 * chunk], @view(x[col_ranges[chunk]]),
+                  one(Tf), @view(x[row_ranges[chunk]]))
+        end
+
+        if total_chunks > 1
+            # In second-to-last chunk, the only possible rectangular block is the one we
+            # calculate, and no other process needs to wait for us.
+            chunk = total_chunks - 1
+
+            # Do triangular solve.
+            # For the triangular part, the 'row ranges' are the same as 'col_ranges',
+            # because this is a diagonal block of L.
+            trsv!('U', 'N', 'N', U_chunks[2 * chunk - 1], @view(x[col_ranges[chunk]]))
+
+            # Need to wait for 'next proc' to finish its rectangular block from the
+            # previous column-chunk before starting the rectangular block.
+            req = MPI.Ibarrier(comm_next_proc)
+            MPI.Wait(req)
+
+            # Multiply rectangular chunk.
+            gemm!('N', 'N', one(Tf), U_chunks[2 * chunk], @view(x[col_ranges[chunk]]),
+                  one(Tf), @view(x[row_ranges[chunk]]))
+        end
+
+        # In final chunk, there is nothing to wait for us after the solve, and no
+        # rectangular block to solve.
+        chunk = total_chunks
+
+        # Do triangular solve.
+        # For the triangular part, the 'row ranges' are the same as 'col_ranges',
+        # because this is a diagonal block of L.
+        trsv!('U', 'N', 'N', U_chunks[2 * chunk - 1], @view(x[col_ranges[chunk]]))
     else
-        error("not implemented yet")
+        if total_chunks > 2
+            # Do chunk=1 first, here no previous column chunk to wait for.
+            chunk = 1
+
+        elseif total_chunks == 2
+            # Signal to 'prev proc' that we have finished this rectangular chunk. We do
+            # not need to wait for 'prev proc'
+            MPI.Ibarrier(comm_prev_proc)
+        end
+
+        for chunk ∈ 2:total_chunks - 2
+            # Need to wait for 'next proc' to finish its rectangular block from the
+            # previous column-chunk before starting the rectangular block.
+            req_next = MPI.Ibarrier(comm_next_proc)
+
+            # Also need to wait for rank-0 to finish its triangular block on this
+            # column-chunk.
+            req_rank0 = MPI.Ibarrier(comm)
+            MPI.Waitall([req_next, req_rank0])
+
+            # Multiply rectangular chunk.
+            gemm!('N', 'N', one(Tf), U_chunks[chunk], @view(x[col_ranges[chunk]]),
+                  one(Tf), @view(x[row_ranges[chunk]]))
+
+            # Signal to 'prev proc' that we have finished this rectangular chunk. We do
+            # not need to wait for 'prev proc'
+            MPI.Ibarrier(comm_prev_proc)
+        end
+
+        if total_chunks > 1
+            # In second-to-last chunk there is no work for this process to do, because the
+            # only rectangular chunk is the one on rank-0, so no need to signal to any other
+            # process to wait. Just need to mop up the MPI.Ibarrier() calls from
+            # total_chunks-2, but do not need to wait for them.
+            MPI.Ibarrier(comm_next_proc)
+        end
     end
 
     return nothing
