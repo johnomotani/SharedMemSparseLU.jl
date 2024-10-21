@@ -747,6 +747,7 @@ function lu!(F::ParallelSparseLU{Tf,Ti},
             F.U = SparseMatrixCSC(F.m, F.n, new_U_colptr, new_U_rowval, new_U_nzval)
         end
     end
+    MPI.Barrier(comm)
     if reallocate[]
         F.wrk_range, F.total_chunks, F.lsolve_col_ranges, F.lsolve_row_ranges,
             F.rsolve_col_ranges, F.rsolve_row_ranges =
