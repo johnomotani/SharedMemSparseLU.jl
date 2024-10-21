@@ -761,7 +761,6 @@ function lsolve!(x, F::ParallelSparseLU{Tf,Ti,TLU}, b) where {Tf,Ti,TLU}
         # Diagonal entry of L
         if comm_rank == comm_size - 1
             # Handle diagonal element of L (which is always 1) using the last rank.
-            x[row] = b[row]
             temp = b[row]
         else
             temp = zero(Tf)
