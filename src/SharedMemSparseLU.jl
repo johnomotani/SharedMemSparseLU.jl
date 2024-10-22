@@ -133,6 +133,7 @@ mutable struct ParallelSparseLU{Tf, Ti,
     U_chunks::Vector{Matrix{Tf}}
     rsolve_col_ranges::Vector{UnitRange{Int64}}
     rsolve_row_ranges::Vector{UnitRange{Int64}}
+    dummy_req::Ref{MPI.Request}
     MPI_Win_store::Vector{MPI.Win}
     MPI_Win_store_internal::Vector{MPI.Win}
 
@@ -304,7 +305,8 @@ mutable struct ParallelSparseLU{Tf, Ti,
                                               total_chunks, L_chunks, lsolve_col_ranges,
                                               lsolve_row_ranges, U_chunks,
                                               rsolve_col_ranges, rsolve_row_ranges,
-                                              MPI_Win_store, MPI_Win_store_internal)
+                                              Ref(MPI.Request()), MPI_Win_store,
+                                              MPI_Win_store_internal)
     end
 end
 
@@ -861,6 +863,7 @@ function lsolve!(F::ParallelSparseLU{Tf,Ti,TLU}, x) where {Tf,Ti,TLU}
     comm_prev_proc = F.comm_prev_proc
     comm_rank = F.comm_rank
     comm_size = F.comm_size
+    dummy_req = F.dummy_req
 
     if comm_rank == 0
         if total_chunks > 2
@@ -891,7 +894,10 @@ function lsolve!(F::ParallelSparseLU{Tf,Ti,TLU}, x) where {Tf,Ti,TLU}
             # The triangular solve needs to complete before any other process starts using
             # x[col_ranges[chunk]] for their rectangular block, but this process does not
             # need to wait for them.
-            req = MPI.Ibarrier(comm)
+            # Apparently need to store the returned request in dummy_req[] to stop Julia
+            # immediately deleting it - the 'finaliser' causes an MPI error. Surely there
+            # is a better way to avoid this problem?
+            dummy_req[] = MPI.Ibarrier(comm)
 
             # Need to wait for 'next proc' to finish its rectangular block from the
             # previous column-chunk before starting the rectangular block.
@@ -1000,6 +1006,7 @@ function rsolve!(F::ParallelSparseLU{Tf,Ti,TLU}, x) where {Tf,Ti,TLU}
     comm_prev_proc = F.comm_prev_proc
     comm_rank = F.comm_rank
     comm_size = F.comm_size
+    dummy_req = F.dummy_req
 
     if comm_rank == 0
         if total_chunks > 2
@@ -1030,7 +1037,10 @@ function rsolve!(F::ParallelSparseLU{Tf,Ti,TLU}, x) where {Tf,Ti,TLU}
             # The triangular solve needs to complete before any other process starts using
             # x[col_ranges[chunk]] for their rectangular block, but this process does not
             # need to wait for them.
-            req = MPI.Ibarrier(comm)
+            # Apparently need to store the returned request in dummy_req[] to stop Julia
+            # immediately deleting it - the 'finaliser' causes an MPI error. Surely there
+            # is a better way to avoid this problem?
+            dummy_req[] = MPI.Ibarrier(comm)
 
             # Need to wait for 'next proc' to finish its rectangular block from the
             # previous column-chunk before starting the rectangular block.
