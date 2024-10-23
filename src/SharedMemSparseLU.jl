@@ -133,9 +133,11 @@ mutable struct ParallelSparseLU{Tf, Ti,
     U_chunks::Vector{Matrix{Tf}}
     rsolve_col_ranges::Vector{UnitRange{Int64}}
     rsolve_row_ranges::Vector{UnitRange{Int64}}
-    dummy_req::Ref{MPI.Request}
     MPI_Win_store::Vector{MPI.Win}
     MPI_Win_store_internal::Vector{MPI.Win}
+    # Retain in this object all MPI.Request objects that we don't explicitly call
+    # MPI.Wait() on until the end of an lsolve!() or rsolve!() call.
+    MPI_Request_store::MPI.MultiRequest
 
     function ParallelSparseLU{Tf,Ti}(A::Union{SparseMatrixCSC{Tf,Ti},Nothing},
                                      comm=MPI.COMM_WORLD,
@@ -305,8 +307,8 @@ mutable struct ParallelSparseLU{Tf, Ti,
                                               total_chunks, L_chunks, lsolve_col_ranges,
                                               lsolve_row_ranges, U_chunks,
                                               rsolve_col_ranges, rsolve_row_ranges,
-                                              Ref(MPI.Request()), MPI_Win_store,
-                                              MPI_Win_store_internal)
+                                              MPI_Win_store, MPI_Win_store_internal,
+                                              MPI.MultiRequest(total_chunks))
     end
 end
 
@@ -832,11 +834,9 @@ function ldiv!(x::AbstractVector, F::ParallelSparseLU{Tf,Ti},
 
     # Do the 'forward substitution', overwriting the result into `wrk`.
     lsolve!(F, wrk)
-    MPI.Barrier(comm)
 
     # Do the 'backward substitution', overwriting the result into `wrk`.
     rsolve!(F, wrk)
-    MPI.Barrier(comm)
 
     # Un-pivot `x`
     q = F.q
@@ -863,7 +863,7 @@ function lsolve!(F::ParallelSparseLU{Tf,Ti,TLU}, x) where {Tf,Ti,TLU}
     comm_prev_proc = F.comm_prev_proc
     comm_rank = F.comm_rank
     comm_size = F.comm_size
-    dummy_req = F.dummy_req
+    request_store = F.MPI_Request_store
 
     if comm_rank == 0
         if total_chunks > 2
@@ -878,7 +878,7 @@ function lsolve!(F::ParallelSparseLU{Tf,Ti,TLU}, x) where {Tf,Ti,TLU}
             # The triangular solve needs to complete before any other process starts using
             # x[col_ranges[chunk]] for their rectangular block, but this process does not
             # need to wait for them.
-            req = MPI.Ibarrier(comm)
+            MPI.Ibarrier(comm, request_store[chunk])
 
             # Multiply rectangular chunk.
             gemm!('N', 'N', one(Tf), L_chunks[2 * chunk], @view(x[col_ranges[chunk]]),
@@ -894,15 +894,12 @@ function lsolve!(F::ParallelSparseLU{Tf,Ti,TLU}, x) where {Tf,Ti,TLU}
             # The triangular solve needs to complete before any other process starts using
             # x[col_ranges[chunk]] for their rectangular block, but this process does not
             # need to wait for them.
-            # Apparently need to store the returned request in dummy_req[] to stop Julia
-            # immediately deleting it - the 'finaliser' causes an MPI error. Surely there
-            # is a better way to avoid this problem?
-            dummy_req[] = MPI.Ibarrier(comm)
+            MPI.Ibarrier(comm, request_store[chunk])
 
             # Need to wait for 'next proc' to finish its rectangular block from the
             # previous column-chunk before starting the rectangular block.
-            req = MPI.Ibarrier(comm_next_proc)
-            MPI.Wait(req)
+            req1 = MPI.Ibarrier(comm_next_proc)
+            MPI.Wait(req1)
 
             # Multiply rectangular chunk.
             gemm!('N', 'N', one(Tf), L_chunks[2 * chunk], @view(x[col_ranges[chunk]]),
@@ -921,8 +918,8 @@ function lsolve!(F::ParallelSparseLU{Tf,Ti,TLU}, x) where {Tf,Ti,TLU}
 
             # Need to wait for 'next proc' to finish its rectangular block from the
             # previous column-chunk before starting the rectangular block.
-            req = MPI.Ibarrier(comm_next_proc)
-            MPI.Wait(req)
+            req2 = MPI.Ibarrier(comm_next_proc)
+            MPI.Wait(req2)
 
             # Multiply rectangular chunk.
             gemm!('N', 'N', one(Tf), L_chunks[2 * chunk], @view(x[col_ranges[chunk]]),
@@ -944,8 +941,8 @@ function lsolve!(F::ParallelSparseLU{Tf,Ti,TLU}, x) where {Tf,Ti,TLU}
 
             # Need to wait for rank-0 to finish its triangular block on this
             # column-chunk.
-            req_rank0 = MPI.Ibarrier(comm)
-            MPI.Wait(req_rank0)
+            req1 = MPI.Ibarrier(comm)
+            MPI.Wait(req1)
 
             # Multiply rectangular chunk.
             gemm!('N', 'N', one(Tf), L_chunks[chunk], @view(x[col_ranges[chunk]]),
@@ -953,22 +950,25 @@ function lsolve!(F::ParallelSparseLU{Tf,Ti,TLU}, x) where {Tf,Ti,TLU}
 
             # Signal to 'prev proc' that we have finished this rectangular chunk. We do
             # not need to wait for 'prev proc'
-            MPI.Ibarrier(comm_prev_proc)
+            MPI.Ibarrier(comm_prev_proc, request_store[chunk])
         elseif total_chunks == 2
+            chunk = 1
             # Signal to 'prev proc' that we have finished this rectangular chunk. We do
             # not need to wait for 'prev proc'
-            MPI.Ibarrier(comm_prev_proc)
+            MPI.Ibarrier(comm_prev_proc, request_store[chunk])
         end
 
         for chunk ∈ 2:total_chunks - 2
             # Need to wait for 'next proc' to finish its rectangular block from the
             # previous column-chunk before starting the rectangular block.
-            req_next = MPI.Ibarrier(comm_next_proc)
+            req2 = MPI.Ibarrier(comm_next_proc)
 
             # Also need to wait for rank-0 to finish its triangular block on this
             # column-chunk.
-            req_rank0 = MPI.Ibarrier(comm)
-            MPI.Waitall([req_next, req_rank0])
+            req3 = MPI.Ibarrier(comm)
+
+            reqs = [req2, req3]
+            MPI.Waitall(reqs)
 
             # Multiply rectangular chunk.
             gemm!('N', 'N', one(Tf), L_chunks[chunk], @view(x[col_ranges[chunk]]),
@@ -976,7 +976,7 @@ function lsolve!(F::ParallelSparseLU{Tf,Ti,TLU}, x) where {Tf,Ti,TLU}
 
             # Signal to 'prev proc' that we have finished this rectangular chunk. We do
             # not need to wait for 'prev proc'
-            MPI.Ibarrier(comm_prev_proc)
+            MPI.Ibarrier(comm_prev_proc, request_store[chunk])
         end
 
         if total_chunks > 1
@@ -984,9 +984,16 @@ function lsolve!(F::ParallelSparseLU{Tf,Ti,TLU}, x) where {Tf,Ti,TLU}
             # only rectangular chunk is the one on rank-0, so no need to signal to any other
             # process to wait. Just need to mop up the MPI.Ibarrier() calls from
             # total_chunks-2, but do not need to wait for them.
-            MPI.Ibarrier(comm_next_proc)
+            chunk = total_chunks - 1
+
+            MPI.Ibarrier(comm_next_proc, request_store[chunk])
         end
     end
+
+    # Free the unused requests - does not matter to this process whether these requests
+    # have completed or not.
+    MPI.Barrier(comm)
+    MPI.free(request_store)
 
     return nothing
 end
@@ -1006,7 +1013,7 @@ function rsolve!(F::ParallelSparseLU{Tf,Ti,TLU}, x) where {Tf,Ti,TLU}
     comm_prev_proc = F.comm_prev_proc
     comm_rank = F.comm_rank
     comm_size = F.comm_size
-    dummy_req = F.dummy_req
+    request_store = F.MPI_Request_store
 
     if comm_rank == 0
         if total_chunks > 2
@@ -1021,7 +1028,7 @@ function rsolve!(F::ParallelSparseLU{Tf,Ti,TLU}, x) where {Tf,Ti,TLU}
             # The triangular solve needs to complete before any other process starts using
             # x[col_ranges[chunk]] for their rectangular block, but this process does not
             # need to wait for them.
-            req = MPI.Ibarrier(comm)
+            MPI.Ibarrier(comm, request_store[chunk])
 
             # Multiply rectangular chunk.
             gemm!('N', 'N', one(Tf), U_chunks[2 * chunk], @view(x[col_ranges[chunk]]),
@@ -1037,15 +1044,12 @@ function rsolve!(F::ParallelSparseLU{Tf,Ti,TLU}, x) where {Tf,Ti,TLU}
             # The triangular solve needs to complete before any other process starts using
             # x[col_ranges[chunk]] for their rectangular block, but this process does not
             # need to wait for them.
-            # Apparently need to store the returned request in dummy_req[] to stop Julia
-            # immediately deleting it - the 'finaliser' causes an MPI error. Surely there
-            # is a better way to avoid this problem?
-            dummy_req[] = MPI.Ibarrier(comm)
+            MPI.Ibarrier(comm, request_store[chunk])
 
             # Need to wait for 'next proc' to finish its rectangular block from the
             # previous column-chunk before starting the rectangular block.
-            req = MPI.Ibarrier(comm_next_proc)
-            MPI.Wait(req)
+            req1 = MPI.Ibarrier(comm_next_proc)
+            MPI.Wait(req1)
 
             # Multiply rectangular chunk.
             gemm!('N', 'N', one(Tf), U_chunks[2 * chunk], @view(x[col_ranges[chunk]]),
@@ -1064,8 +1068,8 @@ function rsolve!(F::ParallelSparseLU{Tf,Ti,TLU}, x) where {Tf,Ti,TLU}
 
             # Need to wait for 'next proc' to finish its rectangular block from the
             # previous column-chunk before starting the rectangular block.
-            req = MPI.Ibarrier(comm_next_proc)
-            MPI.Wait(req)
+            req2 = MPI.Ibarrier(comm_next_proc)
+            MPI.Wait(req2)
 
             # Multiply rectangular chunk.
             gemm!('N', 'N', one(Tf), U_chunks[2 * chunk], @view(x[col_ranges[chunk]]),
@@ -1087,8 +1091,8 @@ function rsolve!(F::ParallelSparseLU{Tf,Ti,TLU}, x) where {Tf,Ti,TLU}
 
             # Need to wait for rank-0 to finish its triangular block on this
             # column-chunk.
-            req_rank0 = MPI.Ibarrier(comm)
-            MPI.Wait(req_rank0)
+            req1 = MPI.Ibarrier(comm)
+            MPI.Wait(req1)
 
             # Multiply rectangular chunk.
             gemm!('N', 'N', one(Tf), U_chunks[chunk], @view(x[col_ranges[chunk]]),
@@ -1096,22 +1100,25 @@ function rsolve!(F::ParallelSparseLU{Tf,Ti,TLU}, x) where {Tf,Ti,TLU}
 
             # Signal to 'prev proc' that we have finished this rectangular chunk. We do
             # not need to wait for 'prev proc'
-            MPI.Ibarrier(comm_prev_proc)
+            MPI.Ibarrier(comm_prev_proc, request_store[chunk])
         elseif total_chunks == 2
+            chunk = 1
             # Signal to 'prev proc' that we have finished this rectangular chunk. We do
             # not need to wait for 'prev proc'
-            MPI.Ibarrier(comm_prev_proc)
+            MPI.Ibarrier(comm_prev_proc, request_store[chunk])
         end
 
         for chunk ∈ 2:total_chunks - 2
             # Need to wait for 'next proc' to finish its rectangular block from the
             # previous column-chunk before starting the rectangular block.
-            req_next = MPI.Ibarrier(comm_next_proc)
+            req2 = MPI.Ibarrier(comm_next_proc)
 
             # Also need to wait for rank-0 to finish its triangular block on this
             # column-chunk.
-            req_rank0 = MPI.Ibarrier(comm)
-            MPI.Waitall([req_next, req_rank0])
+            req3 = MPI.Ibarrier(comm)
+
+            reqs = [req2, req3]
+            MPI.Waitall(reqs)
 
             # Multiply rectangular chunk.
             gemm!('N', 'N', one(Tf), U_chunks[chunk], @view(x[col_ranges[chunk]]),
@@ -1119,17 +1126,23 @@ function rsolve!(F::ParallelSparseLU{Tf,Ti,TLU}, x) where {Tf,Ti,TLU}
 
             # Signal to 'prev proc' that we have finished this rectangular chunk. We do
             # not need to wait for 'prev proc'
-            MPI.Ibarrier(comm_prev_proc)
+            MPI.Ibarrier(comm_prev_proc, request_store[chunk])
         end
 
         if total_chunks > 1
+            chunk = total_chunks - 1
             # In second-to-last chunk there is no work for this process to do, because the
             # only rectangular chunk is the one on rank-0, so no need to signal to any other
             # process to wait. Just need to mop up the MPI.Ibarrier() calls from
             # total_chunks-2, but do not need to wait for them.
-            MPI.Ibarrier(comm_next_proc)
+            MPI.Ibarrier(comm_next_proc, request_store[chunk])
         end
     end
+
+    # Free the unused requests - does not matter to this process whether these requests
+    # have completed or not.
+    MPI.Barrier(comm)
+    MPI.free(request_store)
 
     return nothing
 end
